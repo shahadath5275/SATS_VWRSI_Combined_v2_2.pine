@@ -1,0 +1,22 @@
+# Whitelist repo: ignore everything in this folder by default, then re-include
+# only the Pine Script work. The rest of c:\Users\shah\codedevlop (Python
+# scratch work, CSV data, test files) is intentionally not tracked.
+*
+
+# repo metadata
+!.gitignore
+!README.md
+
+# Pine Script sources
+!*.pine
+
+# backtest pipeline for the EMA strategy
+!pinescript/
+!pinescript/*.py
+!pinescript/*.png
+
+# never track these, even if a rule above would match
+.claude/
+__pycache__/
+.pytest_cache/
+*.zip

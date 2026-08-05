@@ -1,0 +1,1727 @@
+//@version=5
+// ============================================================================
+// SATS + VWRSI COMBINED STRATEGY  v2.0.0
+// Merge of:
+//   - "10 EMA Strategy (Combined)" / Self-Aware Trend System v1.12.0
+//   - "Volume Weighted RSI [AlgoAlpha]"
+//
+// DE-DUPLICATION SUMMARY (what was removed and why):
+//   1. THREE separate RSI engines existed (manual Wilder RSI + ta.rsi +
+//      AlgoAlpha's VWRSI). Now ONE: the volume-weighted RSI. It feeds the
+//      score, the dashboard and the new gate.
+//   2. Chandelier Exit removed entirely. It was a second ATR trailing stop
+//      with ratchet logic - functionally the same thing the SATS adaptive
+//      SuperTrend already does, and it emitted its own competing Buy/Sell
+//      labels. Its useful part (trailing) is now an option on the SATS line.
+//   3. TWO volume-confirmation paths (SMA-of-volume ratio + volume Z-score)
+//      collapsed into ONE z-score based check.
+//   4. Standalone RSI corner table removed - folded into the main dashboard.
+//   5. All 0-100 scale plots/fills from the VWRSI indicator removed. This is
+//      an overlay=true strategy; they cannot share a pane with price. VWRSI
+//      is shown in the dashboard instead.
+//   6. AR(1) linear-regression "predictor" removed by default (see notes).
+//
+// BUG FIXES / LOGIC FIXES (see notes at bottom of file):
+//   A. Entries are now GATED on trend, TQI, ER, consolidation and regime edge.
+//      Previously these were computed, displayed in red on the dashboard, and
+//      then completely ignored by the order logic.
+//   B. EMA engine and SATS engine no longer fight over one net position.
+//   C. process_orders_on_close=true so plotted ENTRY matches the actual fill.
+//   D. range_score() integer-division bug ((2/3) evaluated to 0) fixed.
+//   E. Optional circuit breaker on consecutive losses / negative regime edge.
+// ============================================================================
+
+strategy("SATS + VWRSI Combined v2", overlay = true,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     pyramiding = 0, process_orders_on_close = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000)
+
+// ============================================================================
+// GROUP CONSTANTS
+// ============================================================================
+G_ENGINE  = "1 - Order Engine"
+G_GATE    = "2 - Entry Gate (the fix)"
+G_MAIN    = "3 - Core Settings"
+G_RSI     = "4 - Volume Weighted RSI"
+G_TQI     = "5 - Trend Quality Engine"
+G_ADAPT   = "6 - Adaptive Bands"
+G_EMA     = "7 - EMA Pullback Engine"
+G_RISK    = "8 - Risk Management"
+G_TPP     = "8b - Take Profit Planner"
+G_DYNTP   = "9 - Dynamic TP"
+G_LEARN   = "10 - Self-Learning"
+G_VISUAL  = "11 - Visual"
+G_DASH    = "12 - Dashboard"
+G_ALERT   = "13 - Alerts"
+G_COLORS  = "14 - Colors"
+
+VERSION           = "v2.2.0"
+WARMUP_FLOOR      = 50
+MAX_HISTORY_SIGS  = 100
+BYPASS_SCORE      = 12.0
+HIT_COLOR_HEX     = #40E0D0
+MAX_SCORE_REF     = 100
+
+ER_LOW_THRESH     = 0.25
+ER_HIGH_THRESH    = 0.50
+VOL_LOW_THRESH    = 0.7
+VOL_HIGH_THRESH   = 1.3
+
+EWMA_ALPHA        = 0.2
+MULT_SMOOTH_ALPHA = 0.15
+
+TQI_MULT_FLOOR    = 0.6
+TQI_MULT_RANGE    = 0.8
+ASYM_TIGHTEN_MAX  = 0.3
+ASYM_WIDEN_MAX    = 0.4
+
+GRADE_SCORE_APLUS = 80
+GRADE_SCORE_A     = 60
+GRADE_SCORE_B     = 40
+GRADE_TQI_APLUS   = 0.70
+GRADE_TQI_A       = 0.50
+GRADE_TQI_B       = 0.35
+
+// ============================================================================
+// INPUTS - ORDER ENGINE
+// ============================================================================
+engineModeInput = input.string("SATS + EMA filter", "Signal Engine",
+     options = ["SATS + EMA filter", "EMA + SATS filter", "SATS only", "EMA only"],
+     group = G_ENGINE,
+     tooltip = "The old script ran the EMA system and the SATS system as two independent order sources on ONE net position, so they netted against each other. Now one is the trigger and the other is a confirming filter.")
+
+allowLongs  = input.bool(true,  "Allow Longs",  inline = "dir", group = G_ENGINE)
+allowShorts = input.bool(true,  "Allow Shorts", inline = "dir", group = G_ENGINE)
+
+// ============================================================================
+// INPUTS - ENTRY GATE
+// ============================================================================
+useGateInput       = input.bool(true, "Enable Entry Gate", group = G_GATE,
+     tooltip = "Master switch. OFF reproduces the old ungated behaviour (not recommended).")
+gateTrendInput     = input.bool(true, "Block counter-trend entries", group = G_GATE,
+     tooltip = "No shorts while the SuperTrend regime is Bullish, no longs while Bearish. This is the single most important filter - the old script printed SHORT arrows while its own dashboard said 'Bullish UP'.")
+gateTqiInput       = input.bool(true,  "Require minimum TQI", inline = "gt", group = G_GATE)
+gateTqiMinInput    = input.float(0.40, "", minval = 0.0, maxval = 1.0, step = 0.05, inline = "gt", group = G_GATE)
+gateErInput        = input.bool(true,  "Require minimum ER", inline = "ge", group = G_GATE)
+gateErMinInput     = input.float(0.30, "", minval = 0.0, maxval = 1.0, step = 0.05, inline = "ge", group = G_GATE)
+gateChopInput      = input.bool(true,  "Block entries while consolidating", group = G_GATE,
+     tooltip = "Uses the VWRSI consolidation-strength measure (ported from the AlgoAlpha indicator). Previously this was drawn as columns and never used for anything.")
+gateChopMaxInput   = input.float(0.15, "Max consolidation strength", minval = 0.0, maxval = 1.0, step = 0.05, group = G_GATE)
+gateRsiInput       = input.bool(true,  "Require VWRSI agreement", group = G_GATE,
+     tooltip = "Long needs VWRSI above midline, short needs VWRSI below.")
+gateVolInput       = input.bool(true,  "Require volume confirmation", inline = "gv", group = G_GATE)
+gateVolZMinInput   = input.float(0.0,  "", minval = -3.0, maxval = 3.0, step = 0.1, inline = "gv", group = G_GATE)
+gateEdgeInput      = input.bool(true,  "Block on negative regime edge", group = G_GATE,
+     tooltip = "If this ER/volatility cell has a measured negative expectancy over the minimum sample, stop taking trades in it.")
+gateEdgeMinNInput  = input.int(8, "Min samples before edge gate applies", minval = 3, maxval = 50, group = G_GATE)
+
+useBreakerInput    = input.bool(true, "Circuit breaker on loss streak", inline = "cb", group = G_GATE)
+breakerLossesInput = input.int(4, "", minval = 2, maxval = 20, inline = "cb", group = G_GATE)
+breakerCoolInput   = input.int(10, "Cooldown bars after breaker trips", minval = 1, maxval = 200, group = G_GATE)
+
+// ============================================================================
+// INPUTS - CORE
+// ============================================================================
+presetInput   = input.string("Auto", "Preset", options = ["Auto", "Custom", "Scalping", "Default", "Swing", "Crypto 24/7"], group = G_MAIN)
+atrLenInput   = input.int(13, "ATR Length", minval = 5, maxval = 100, group = G_MAIN)
+baseMultInput = input.float(2.0, "Base Band Width (xATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = G_MAIN)
+sourceInput   = input.source(close, "Source", group = G_MAIN)
+
+// ============================================================================
+// INPUTS - VOLUME WEIGHTED RSI  (single RSI for the whole script)
+// ============================================================================
+rsiLenInput      = input.int(14, "VWRSI Length", minval = 2, maxval = 50, group = G_RSI)
+rsiSourceInput   = input.source(close, "VWRSI Source", group = G_RSI)
+rsiOBInput       = input.int(70, "Overbought", minval = 55, maxval = 90, inline = "ob", group = G_RSI)
+rsiOSInput       = input.int(30, "Oversold",   minval = 10, maxval = 45, inline = "ob", group = G_RSI)
+rsiLookbackInput = input.int(20, "RSI Memory (bars)", minval = 3, maxval = 100, group = G_RSI)
+rangeLenInput    = input.int(10, "Consolidation Detection Length", minval = 2, maxval = 50, group = G_RSI)
+useRsiMaInput    = input.bool(true, "Enable VWRSI MA", inline = "rma", group = G_RSI)
+rsiMaTypeInput   = input.string("EMA", "", options = ["EMA", "SMA", "HMA", "SMMA (RMA)", "WMA", "VWMA"], inline = "rma", group = G_RSI)
+rsiMaLenInput    = input.int(14, "VWRSI MA Length", minval = 2, maxval = 100, group = G_RSI)
+
+// ============================================================================
+// INPUTS - TQI
+// ============================================================================
+useTqiInput          = input.bool(true, "Enable Trend Quality Engine", group = G_TQI)
+qualityStrengthInput = input.float(0.4, "Quality Influence", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+qualityCurveInput    = input.float(1.5, "Quality Curve Power", minval = 1.0, maxval = 3.0, step = 0.1, group = G_TQI)
+multSmoothInput      = input.bool(true, "Smooth Adaptive Multipliers", group = G_TQI)
+useAsymBandsInput    = input.bool(true, "Asymmetric Bands", group = G_TQI)
+asymStrengthInput    = input.float(0.5, "Asymmetry Strength", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+useEffAtrInput       = input.bool(true, "Efficiency-Weighted ATR", group = G_TQI)
+useCharFlipInput     = input.bool(true, "Character-Flip Detection", group = G_TQI)
+charFlipMinAgeInput  = input.int(5, "Char-Flip: Min Trend Age / Window", minval = 1, maxval = 50, group = G_TQI)
+charFlipHighInput    = input.float(0.55, "Char-Flip: High TQI", minval = 0.3, maxval = 0.9, step = 0.05, group = G_TQI)
+charFlipLowInput     = input.float(0.25, "Char-Flip: Low TQI", minval = 0.0, maxval = 0.5, step = 0.05, group = G_TQI)
+tqiWeightErInput     = input.float(0.35, "Weight: Efficiency", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+tqiWeightVolInput    = input.float(0.20, "Weight: Volatility Regime", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+tqiWeightStructInput = input.float(0.25, "Weight: Structure", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+tqiWeightMomInput    = input.float(0.20, "Weight: Momentum Persist", minval = 0.0, maxval = 1.0, step = 0.05, group = G_TQI)
+tqiStructLenInput    = input.int(20, "Structure Window", minval = 5, maxval = 100, group = G_TQI)
+tqiMomLenInput       = input.int(10, "Momentum Persist Window", minval = 3, maxval = 50, group = G_TQI)
+
+useStructureInput = input.bool(true, "Use Structure in Score", group = G_TQI)
+pivotLenInput     = input.int(3, "Pivot Strength", minval = 2, maxval = 10, group = G_TQI)
+useRsiScoreInput  = input.bool(true, "Use VWRSI in Score", group = G_TQI)
+useVolScoreInput  = input.bool(true, "Use Volume in Score", group = G_TQI)
+volLenInput       = input.int(20, "Volume Z Window", minval = 5, maxval = 100, group = G_TQI)
+
+// ============================================================================
+// INPUTS - ADAPTIVE
+// ============================================================================
+useAdaptiveInput    = input.bool(true, "Enable Vol-Adaptive Bands (legacy ER)", group = G_ADAPT)
+erLengthInput       = input.int(20, "Efficiency Window", minval = 5, maxval = 100, group = G_ADAPT)
+adaptStrengthInput  = input.float(0.5, "Adaptation Strength", minval = 0.0, maxval = 1.0, step = 0.05, group = G_ADAPT)
+atrBaselineLenInput = input.int(100, "ATR Baseline Length", minval = 20, maxval = 500, group = G_ADAPT)
+
+// ============================================================================
+// INPUTS - EMA ENGINE
+// ============================================================================
+emaLengthInput  = input.int(10, "EMA Length", minval = 2, maxval = 200, group = G_EMA)
+emaPullbackInput = input.bool(true, "Pullback Mode (else simple crossover)", group = G_EMA,
+     tooltip = "ON = wait for pullback to EMA + reversal candle. OFF = raw crossover (noisy on 5m).")
+emaFilterSlackInput = input.float(0.0, "EMA Filter Slack (xATR)", minval = 0.0, maxval = 2.0, step = 0.1, group = G_EMA,
+     tooltip = "When EMA acts as a filter, how far price may sit on the wrong side of the EMA and still pass.")
+
+// ============================================================================
+// INPUTS - RISK
+// ============================================================================
+slAtrMultInput   = input.float(1.5, "SL Buffer (xATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = G_RISK)
+slMaxDistInput   = input.float(4.0, "Max SL Distance (xATR)", minval = 1.0, maxval = 15.0, step = 0.5, group = G_RISK)
+tpModeInput      = input.string("Dynamic", "TP Mode", options = ["Fixed", "Dynamic"], group = G_RISK,
+     tooltip = "Default changed to Dynamic. Fixed R-multiples on a high-volatility name means targets are either unreachable or trivially blown through.")
+tp1RInput        = input.float(1.0, "TP1 (R-multiple)", minval = 0.5, maxval = 10.0, step = 0.1, group = G_RISK)
+tp2RInput        = input.float(2.0, "TP2 (R-multiple)", minval = 0.5, maxval = 10.0, step = 0.1, group = G_RISK)
+tp3RInput        = input.float(3.0, "TP3 (R-multiple)", minval = 0.5, maxval = 10.0, step = 0.1, group = G_RISK)
+useTrailInput    = input.bool(true, "Trail stop to SuperTrend line after TP1", group = G_RISK,
+     tooltip = "Replaces the removed Chandelier Exit. Once TP1 is banked the stop follows the adaptive band instead of sitting at the original SL.")
+useBeInput       = input.bool(true, "Move stop to breakeven after TP1", group = G_RISK)
+tradeMaxAgeInput = input.int(100, "Trade Timeout (bars)", minval = 10, maxval = 500, group = G_RISK)
+
+dynTpTqiWeightInput = input.float(0.6, "TQI Influence on TP", minval = 0.0, maxval = 1.0, step = 0.05, group = G_DYNTP)
+dynTpVolWeightInput = input.float(0.4, "Volatility Influence on TP", minval = 0.0, maxval = 1.0, step = 0.05, group = G_DYNTP)
+dynTpMinScaleInput  = input.float(0.5, "Min TP Scale", minval = 0.2, maxval = 1.0, step = 0.05, group = G_DYNTP)
+dynTpMaxScaleInput  = input.float(2.0, "Max TP Scale", minval = 1.0, maxval = 4.0, step = 0.1, group = G_DYNTP)
+dynTpFloorR1Input   = input.float(0.5, "TP1 Absolute Floor (R)", minval = 0.2, maxval = 2.0, step = 0.1, group = G_DYNTP)
+dynTpCeilR3Input    = input.float(8.0, "TP Absolute Ceiling (R)", minval = 2.0, maxval = 20.0, step = 0.5, group = G_DYNTP)
+
+// ============================================================================
+// INPUTS - TAKE PROFIT PLANNER
+// Decision layer ported from "Take Profit Planner [AGPro Series]" v1.4.
+// It does NOT build its own ladder, stop, ATR, pivots or trend model - it
+// reads the plan this strategy already produced. When flat it scores the
+// hypothetical trade you would get if you entered right now.
+// ============================================================================
+showPlannerInput      = input.bool(true, "Enable TP Planner", group = G_TPP)
+plannerSensInput      = input.string("Balanced", "Sensitivity", options = ["Conservative", "Balanced", "Reactive"], group = G_TPP,
+     tooltip = "Conservative demands a cleaner path before calling a target Ready. Reactive reacts faster.")
+obstructLookbackInput = input.int(80, "Obstruction Lookback", minval = 10, maxval = 300, group = G_TPP,
+     tooltip = "Bars searched for a prior swing sitting between price and the nearest unhit target.")
+tagBufferAtrInput     = input.float(0.20, "Tagged Target Buffer (xATR)", minval = 0.02, maxval = 1.50, step = 0.01, group = G_TPP)
+minTargetAtrInput     = input.float(0.65, "Minimum Useful Target (xATR)", minval = 0.10, maxval = 5.00, step = 0.05, group = G_TPP)
+idealTargetAtrInput   = input.float(2.40, "Ideal Target Distance (xATR)", minval = 0.30, maxval = 10.00, step = 0.05, group = G_TPP)
+maxTargetAtrInput     = input.float(6.50, "Maximum Practical Target (xATR)", minval = 1.00, maxval = 20.00, step = 0.10, group = G_TPP)
+hotVolRatioInput      = input.float(2.25, "Hot Volatility Ratio", minval = 1.10, maxval = 5.00, step = 0.05, group = G_TPP)
+readyThresholdInput   = input.int(72, "Target Ready Threshold", minval = 45, maxval = 95, group = G_TPP)
+watchThresholdInput   = input.int(54, "Monitor Threshold", minval = 20, maxval = 90, group = G_TPP)
+
+gateQualityInput      = input.bool(true, "Gate entries on Target Quality", inline = "gq", group = G_TPP,
+     tooltip = "Blocks a new entry when the planner rates the prospective target path below the Monitor threshold - i.e. it would say 'Wait For Cleaner Path'.")
+gateQualityMinInput   = input.int(54, "", minval = 0, maxval = 100, inline = "gq", group = G_TPP)
+gateObstructInput     = input.bool(true, "Block entries with an obstruction in the path", group = G_TPP)
+gateProofInput        = input.bool(false, "Gate on measured proof rate", inline = "gp", group = G_TPP,
+     tooltip = "Once enough trades have resolved, stop entering when the share reaching TP1 before the stop falls below this.")
+gateProofMinInput     = input.int(40, "", minval = 0, maxval = 100, inline = "gp", group = G_TPP)
+proofMinSampleInput   = input.int(6, "Min resolved trades before proof applies", minval = 3, maxval = 50, group = G_TPP)
+
+// ---- target engine: direction, anchor, invalidation ----
+// Pivot / ATR / baseline / trend context lengths are NOT duplicated here - the
+// planner reads the ones the strategy already resolved (pivotLenInput,
+// effectiveAtrLen, atrBaselineLenInput, tqiStructLenInput) so there is one
+// source of truth per measurement.
+planDirInput          = input.string("Auto", "Plan Direction", options = ["Auto", "Long", "Short"], group = G_TPP,
+     tooltip = "Auto follows the SuperTrend regime. Long/Short force the prospective plan to one side so you can score the trade you are actually considering. A live trade always keeps its own direction.")
+planCalcModeInput     = input.string("Auto - Strategy SL", "Calculation Mode", options = ["Auto - Strategy SL", "Hybrid (ATR + Structure)", "ATR Only", "Structure Only", "Manual"], group = G_TPP,
+     tooltip = "How the prospective invalidation is built. Auto reproduces the strategy's own SL logic (default, behaviour unchanged). Hybrid takes whichever of the distance stop and the structure stop sits further from the anchor. ATR Only uses the distance metric alone, Structure Only uses the swing alone, Manual uses Manual Invalidation Price.")
+anchorSrcInput        = input.string("Auto - Pivot", "Anchor Source", options = ["Auto - Pivot", "Close", "Session Open", "Manual"], group = G_TPP,
+     tooltip = "Where the entry reference comes from. Auto - Pivot anchors entry at the close and measures structure from the last pivot. Manual uses Manual Entry Price plus Manual Swing / Origin Price, and takes precedence over a live trade so you can score a level you have not entered yet.")
+
+// ---- anchor and invalidation ----
+manualEntryInput      = input.float(0.0, "Manual Entry Price", minval = 0.0, step = 0.01, group = G_TPP,
+     tooltip = "Used only when Anchor Source is Manual. 0 disables.")
+manualOriginInput     = input.float(0.0, "Manual Swing / Origin Price", minval = 0.0, step = 0.01, group = G_TPP,
+     tooltip = "The swing the move started from. Replaces the auto pivot as the structure reference in every calculation mode. 0 disables.")
+manualInvalidInput    = input.float(0.0, "Manual Invalidation Price", minval = 0.0, step = 0.01, group = G_TPP,
+     tooltip = "Used only when Calculation Mode is Manual. 0 disables and falls back to the strategy SL. A manual invalidation is not distance-capped.")
+autoInvalidModeInput  = input.string("ATR Multiple", "Auto Invalidation Mode", options = ["ATR Multiple", "Fixed Percent"], group = G_TPP,
+     tooltip = "The distance metric used by the Hybrid and ATR Only calculation modes.")
+invalidAtrMultInput   = input.float(1.8, "ATR Multiple", minval = 0.1, maxval = 10.0, step = 0.1, group = G_TPP)
+invalidPctInput       = input.float(1.5, "Fixed Percent", minval = 0.05, maxval = 25.0, step = 0.05, group = G_TPP)
+
+// ---- projected ladder visual ----
+showLadderInput       = input.bool(true, "Draw Projected TP Ladder", group = G_TPP,
+     tooltip = "Draws the entry reference, invalidation and the full TP ladder projected to the right of price - visible whether a trade is open or you are flat.")
+plannerTiersInput     = input.int(5, "Ladder Tiers to Display", minval = 3, maxval = 7, group = G_TPP,
+     tooltip = "TP1-TP3 are the tiers this strategy actually scales out of. TP4-TP7 are planning-only extensions shown for target context; no orders are placed at them.")
+tp4RInput             = input.float(5.0,  "TP4 R (planning only)", minval = 0.1, step = 0.1, group = G_TPP)
+tp5RInput             = input.float(8.0,  "TP5 R (planning only)", minval = 0.1, step = 0.1, group = G_TPP)
+tp6RInput             = input.float(13.0, "TP6 R (planning only)", minval = 0.1, step = 0.1, group = G_TPP)
+tp7RInput             = input.float(21.0, "TP7 R (planning only)", minval = 0.1, step = 0.1, group = G_TPP)
+zoneWidthAtrInput     = input.float(0.24, "TP Zone Half-Width (xATR)", minval = 0.03, maxval = 2.00, step = 0.01, group = G_TPP)
+projectionBarsInput   = input.int(54, "Projection Bars", minval = 12, maxval = 240, group = G_TPP)
+zoneTranspInput       = input.int(88, "Zone Transparency", minval = 70, maxval = 96, group = G_TPP)
+showLadderLabelsInput = input.bool(true, "Show Ladder Labels", group = G_TPP)
+showPlanMarkerInput   = input.bool(true, "Mark Plan-State Changes On Chart", group = G_TPP,
+     tooltip = "Prints a bubble on the bar where the planner state flips (TARGET READY, BLOCKED, INVALID REVIEW, ...) with the target-quality score at that moment.")
+planMarkerKeepInput   = input.int(12, "Plan-State Markers to Keep", minval = 1, maxval = 100, group = G_TPP)
+
+// ============================================================================
+// INPUTS - LEARNING
+// ============================================================================
+useAutoCalibInput  = input.bool(false, "Enable Auto-Calibration (experimental)", group = G_LEARN)
+calibWindowInput   = input.int(20, "Calibration Window", minval = 5, maxval = 100, group = G_LEARN)
+calibBadRInput     = input.float(0.0, "Bad-Edge Threshold (R)", minval = -2.0, maxval = 1.0, step = 0.1, group = G_LEARN)
+calibGoodRInput    = input.float(0.7, "Good-Edge Threshold (R)", minval = 0.0, maxval = 5.0, step = 0.1, group = G_LEARN)
+calibStepQInput    = input.float(0.05, "Quality Step", minval = 0.01, maxval = 0.3, step = 0.01, group = G_LEARN)
+calibCooldownInput = input.int(5, "Calibration Cooldown (signals)", minval = 1, maxval = 50, group = G_LEARN)
+calibMinQInput     = input.float(0.1, "Quality Floor", minval = 0.0, maxval = 1.0, step = 0.05, group = G_LEARN)
+calibMaxQInput     = input.float(0.9, "Quality Ceiling", minval = 0.0, maxval = 1.0, step = 0.05, group = G_LEARN)
+
+// ============================================================================
+// INPUTS - VISUAL / DASH / ALERT / COLORS
+// ============================================================================
+themeInput          = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = G_VISUAL)
+showBandsInput      = input.bool(true,  "Show SuperTrend Bands", group = G_VISUAL)
+showEmaInput        = input.bool(true,  "Show EMA", group = G_VISUAL)
+showTqiColorInput   = input.bool(true,  "Color Line by TQI", group = G_VISUAL)
+showSignalsInput    = input.bool(true,  "Show Signal Labels", group = G_VISUAL)
+showBlockedInput    = input.bool(false, "Mark Gate-Blocked Signals", group = G_VISUAL,
+     tooltip = "Shows small x marks where a raw signal fired but the gate rejected it. Useful for tuning the gate.")
+showBgInput         = input.bool(false, "Show Trend Background", group = G_VISUAL)
+
+showDashInput         = input.bool(true,  "Show Dashboard", group = G_DASH)
+showTqiBreakdownInput = input.bool(true,  "Show TQI Breakdown", group = G_DASH)
+showPerfInput         = input.bool(true,  "Show Performance Stats", group = G_DASH)
+showGateRowsInput     = input.bool(true,  "Show Gate Status", group = G_DASH)
+dashPosStr            = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right"], group = G_DASH)
+dashLayoutInput       = input.string("Side by Side", "Panel Layout", options = ["Side by Side", "Stacked", "Separate Positions"], group = G_DASH,
+     tooltip = "Side by Side puts the signal panel and the TP Planner panel in one four-column table so they sit next to each other. Separate Positions gives the planner its own corner.")
+plannerPosStr         = input.string("Middle Right", "TP Planner Position (Separate only)", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right", "Middle Left", "Bottom Center"], group = G_DASH)
+
+enableAlertsInput = input.bool(true, "Enable Alert Signals", group = G_ALERT)
+webhookInput      = input.bool(false, "Webhook JSON Format", group = G_ALERT)
+
+bullColorInput = input.color(#00E676, "Bull", inline = "c1", group = G_COLORS)
+bearColorInput = input.color(#FF5252, "Bear", inline = "c1", group = G_COLORS)
+slColorInput   = input.color(#FF1744, "SL",   inline = "c2", group = G_COLORS)
+tpColorInput   = input.color(#00E676, "TP",   inline = "c2", group = G_COLORS)
+
+// ============================================================================
+// PRESET RESOLUTION
+// ============================================================================
+int tfMinutes = timeframe.in_seconds(timeframe.period) / 60
+
+string resolvedPreset = presetInput
+if presetInput == "Auto"
+    resolvedPreset := tfMinutes <= 5 ? "Scalping" : (tfMinutes <= 240 ? "Default" : "Swing")
+
+int effectiveAtrLen = switch resolvedPreset
+    "Scalping"    => 10
+    "Default"     => 14
+    "Swing"       => 21
+    "Crypto 24/7" => 14
+    => atrLenInput
+
+float effectiveBaseMult = switch resolvedPreset
+    "Scalping"    => 1.5
+    "Default"     => 2.0
+    "Swing"       => 2.5
+    "Crypto 24/7" => 2.8
+    => baseMultInput
+
+int effectiveErLen = switch resolvedPreset
+    "Scalping"    => 14
+    "Default"     => 20
+    "Swing"       => 30
+    "Crypto 24/7" => 20
+    => erLengthInput
+
+int effectiveRsiLen = switch resolvedPreset
+    "Scalping"    => 9
+    "Default"     => 14
+    "Swing"       => 21
+    "Crypto 24/7" => 14
+    => rsiLenInput
+
+float effectiveSlMult = switch resolvedPreset
+    "Scalping"    => 1.0
+    "Default"     => 1.5
+    "Swing"       => 2.0
+    "Crypto 24/7" => 2.5
+    => slAtrMultInput
+
+float fixedTp1R = math.min(tp1RInput, math.min(tp2RInput, tp3RInput))
+float fixedTp3R = math.max(tp1RInput, math.max(tp2RInput, tp3RInput))
+float fixedTp2R = tp1RInput + tp2RInput + tp3RInput - fixedTp1R - fixedTp3R
+
+// ============================================================================
+// THEME
+// ============================================================================
+isDark = switch themeInput
+    "Dark"  => true
+    "Light" => false
+    =>         color.r(chart.bg_color) < 128
+
+TEXT_COLOR    = isDark ? #E0E0E0 : #1A1A1A
+TEXT_MUTED    = isDark ? color.new(#9E9E9E, 0) : color.new(#757575, 0)
+TEXT_BRIGHT   = isDark ? #FFFFFF : #000000
+TABLE_BG      = isDark ? color.new(#131722, 5) : color.new(#FFFFFF, 5)
+TABLE_BORDER  = isDark ? color.new(#2A2E39, 0) : color.new(#D0D0D0, 0)
+TABLE_ROW_ALT = isDark ? color.new(#1C2030, 0) : color.new(#F0F4F8, 0)
+HEADER_BG     = color.new(#2962FF, 0)
+HEADER_TEXT   = #FFFFFF
+LABEL_TEXT    = #FFFFFF
+BULL_BG       = color.new(bullColorInput, 92)
+BEAR_BG       = color.new(bearColorInput, 92)
+NEUTRAL_YELLOW = color.new(#FFEB3B, 0)
+HIT_COLOR     = color.new(HIT_COLOR_HEX, 0)
+
+// ============================================================================
+// SHARED HELPER FUNCTIONS
+// ============================================================================
+safeDiv(float num, float den, float fallback = 0.0) =>
+    den != 0 and not na(num) and not na(den) ? num / den : fallback
+
+clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+clampInt(int v, int lo, int hi) =>
+    math.max(lo, math.min(hi, v))
+
+mapClamp(float v, float inLo, float inHi, float outLo, float outHi) =>
+    float t = clamp(safeDiv(v - inLo, inHi - inLo, 0.0), 0.0, 1.0)
+    outLo + t * (outHi - outLo)
+
+mapClampInv(float v, float inLo, float inHi, float outHigh, float outLow) =>
+    float t = clamp(safeDiv(v - inLo, inHi - inLo, 0.0), 0.0, 1.0)
+    outHigh - t * (outHigh - outLow)
+
+calcEfficiencyRatio(float src, int len) =>
+    float chg = math.abs(src - src[len])
+    float vol = math.sum(math.abs(src - src[1]), len)
+    safeDiv(chg, vol, 0.0)
+
+calcVolumeZ(int len) =>
+    float vMean = ta.sma(volume, len)
+    float vStd  = ta.stdev(volume, len)
+    safeDiv(volume - vMean, vStd, 0.0)
+
+getDashPos(string s) =>
+    switch s
+        "Top Left"      => position.top_left
+        "Top Right"     => position.top_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Right"  => position.bottom_right
+        "Middle Left"   => position.middle_left
+        "Bottom Center" => position.bottom_center
+        =>                 position.middle_right
+
+// ---- TP Planner scoring helpers (from the AGPro Take Profit Planner) ----
+normHighGood(float value, float weak, float strong) =>
+    float span = strong - weak
+    span == 0.0 ? 0.0 : clamp((value - weak) / span * 100.0, 0.0, 100.0)
+
+normLowGood(float value, float good, float bad) =>
+    float span = bad - good
+    span == 0.0 ? 0.0 : clamp((bad - value) / span * 100.0, 0.0, 100.0)
+
+peakScore(float value, float lowValue, float idealValue, float highValue) =>
+    value <= idealValue ? normHighGood(value, lowValue, idealValue) : normLowGood(value, idealValue, highValue)
+
+roundUnit(float price) =>
+    float p = math.abs(price)
+    p >= 10000.0 ? 1000.0 : p >= 1000.0 ? 100.0 : p >= 100.0 ? 10.0 : p >= 10.0 ? 1.0 : p >= 1.0 ? 0.10 : p >= 0.10 ? 0.01 : p >= 0.01 ? 0.001 : 0.0001
+
+fmtPrice(float price) =>
+    na(price) ? "n/a" : str.tostring(price, format.mintick)
+
+// ---- dashboard cell writers (params untyped so one pair serves both tables) ----
+dashRow(t, c, r, k, v, vc, alt) =>
+    color bg = alt ? TABLE_ROW_ALT : color.new(color.black, 100)
+    table.cell(t, c,     r, k, text_color = TEXT_MUTED, text_size = size.small, bgcolor = bg)
+    table.cell(t, c + 1, r, v, text_color = vc,         text_size = size.small, bgcolor = bg)
+
+dashHdr(t, c, r, l, rt) =>
+    table.cell(t, c,     r, l,  text_color = HEADER_TEXT, bgcolor = HEADER_BG, text_size = size.small, text_halign = text.align_center)
+    table.cell(t, c + 1, r, rt, text_color = HEADER_TEXT, bgcolor = HEADER_BG, text_size = size.small, text_halign = text.align_center)
+
+erBin(float er) =>
+    er < ER_LOW_THRESH ? 0 : (er < ER_HIGH_THRESH ? 1 : 2)
+
+volBin(float vRatio) =>
+    vRatio < VOL_LOW_THRESH ? 0 : (vRatio < VOL_HIGH_THRESH ? 1 : 2)
+
+cellIdx(int eb, int vb) =>
+    eb * 3 + vb
+
+// ---- MA switch, ported from the VWRSI indicator ----
+maSwitch(float source, int length, string mtype) =>
+    switch mtype
+        "SMA"        => ta.sma(source, length)
+        "HMA"        => ta.hma(source, length)
+        "EMA"        => ta.ema(source, length)
+        "SMMA (RMA)" => ta.rma(source, length)
+        "WMA"        => ta.wma(source, length)
+        "VWMA"       => ta.vwma(source, length)
+        =>              ta.ema(source, length)
+
+// ---- Volume weighted RMA, ported from the VWRSI indicator ----
+vwRma(float x, int y) =>
+    float num = ta.rma(x * volume, y)
+    float den = ta.rma(volume, y)
+    safeDiv(num, den, ta.rma(x, y))
+
+// ---- Consolidation strength, ported from the VWRSI indicator ----
+// FIX: original used (2/3) which is INTEGER division in Pine and evaluates to
+// 0, silently killing the second term. Now 2.0/3.0. Also fixed the mixed
+// tab/space indentation on the final line and guarded length/2 against 0.
+rangeScore(float src, int length) =>
+    int   dir  = src > 50 ? 1 : -1
+    float dist = 1.0
+    float t    = (dir + nz(dir[1], dir)) == 0 ? 1.0 : 0.0
+    float w    = safeDiv(dist, math.sum(dist, length), 0.0)
+    float p    = ta.sma(t * w, length)
+    int   v    = math.max(int(length / 2), 2)
+    float f    = ta.hma(p, v) * (v + ((2.0 / 3.0) * v))
+    math.max(nz(ta.hma(f, length * 2), 0.0), 0.0)
+
+calcRealizedR(bool slHit, bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2R, float tp3R) =>
+    float realizedR = 0.0
+    if tp3H
+        realizedR := (tp1R + tp2R + tp3R) / 3.0
+    else if slHit
+        float taken = 0.0
+        float remaining = 1.0
+        if tp1H
+            taken += (1.0 / 3.0) * tp1R
+            remaining -= 1.0 / 3.0
+        if tp2H
+            taken += (1.0 / 3.0) * tp2R
+            remaining -= 1.0 / 3.0
+        realizedR := taken + remaining * (-1.0)
+    realizedR
+
+calcTimeoutR(bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2R, float tp3R) =>
+    float taken = 0.0
+    if tp1H
+        taken += (1.0 / 3.0) * tp1R
+    if tp2H
+        taken += (1.0 / 3.0) * tp2R
+    if tp3H
+        taken += (1.0 / 3.0) * tp3R
+    taken
+
+calcDynTpScale(float tqiVal, float volRatioVal, float tqiW, float volW, float minS, float maxS) =>
+    float tqiComp  = clamp(tqiVal, 0.0, 1.0)
+    float volComp  = clamp(mapClamp(volRatioVal, 0.5, 2.0, 0.0, 1.0), 0.0, 1.0)
+    float wSum     = tqiW + volW
+    float wDenom   = wSum > 0 ? wSum : 1.0
+    float rawScale = (tqiComp * tqiW + volComp * volW) / wDenom
+    minS + rawScale * (maxS - minS)
+
+// ============================================================================
+// LEARNING STORAGE
+// ============================================================================
+var array<float> signalRBuffer = array.new<float>()
+var array<int>   gridCount     = array.new<int>(9, 0)
+var array<float> gridEwmR      = array.new<float>(9, 0.0)
+
+updateGridCell(int idx, float r) =>
+    if idx >= 0 and idx < 9
+        int   c       = array.get(gridCount, idx) + 1
+        float prevEwm = array.get(gridEwmR, idx)
+        float newEwm  = c == 1 ? r : prevEwm * (1.0 - EWMA_ALPHA) + r * EWMA_ALPHA
+        array.set(gridCount, idx, c)
+        array.set(gridEwmR,  idx, newEwm)
+
+getRegimeEdge(int idx) =>
+    int   c   = idx >= 0 and idx < 9 ? array.get(gridCount, idx) : 0
+    float ewm = idx >= 0 and idx < 9 ? array.get(gridEwmR,  idx) : 0.0
+    [c, ewm]
+
+calcRollingStats(int window) =>
+    int n = array.size(signalRBuffer)
+    if n == 0
+        [0.0, 0.0, 0.0]
+    else
+        int startIdx = math.max(0, n - window)
+        float sumR = 0.0
+        int   wins = 0
+        float runningR = 0.0
+        float minRun   = 0.0
+        for i = startIdx to n - 1
+            float r = array.get(signalRBuffer, i)
+            sumR += r
+            if r > 0
+                wins += 1
+            runningR += r
+            if runningR < minRun
+                minRun := runningR
+        int   cnt   = n - startIdx
+        float winRt = cnt > 0 ? float(wins) / float(cnt) : 0.0
+        float avgR  = cnt > 0 ? sumR / float(cnt) : 0.0
+        [winRt, avgR, minRun]
+
+type LearnState
+    float allTimeRSum       = 0.0
+    int   allTimeCount      = 0
+    float allTimePeak       = 0.0
+    float allTimeTrough     = 0.0
+    float allTimeCumR       = 0.0
+    int   curWinStreak      = 0
+    int   curLossStreak     = 0
+    int   maxWinStreak      = 0
+    int   maxLossStreak     = 0
+    int   signalsSinceCalib = 0
+    float effQ              = na
+    int   lastShiftDir      = 0
+    float avgRAtLastShift   = na
+    int   breakerUntilBar   = 0
+
+method record(LearnState this, float r, int cIdx) =>
+    array.push(signalRBuffer, r)
+    while array.size(signalRBuffer) > MAX_HISTORY_SIGS
+        array.shift(signalRBuffer)
+    this.allTimeRSum  += r
+    this.allTimeCount += 1
+    this.allTimeCumR  += r
+    if this.allTimeCumR > this.allTimePeak
+        this.allTimePeak := this.allTimeCumR
+    float curDD = this.allTimeCumR - this.allTimePeak
+    if curDD < this.allTimeTrough
+        this.allTimeTrough := curDD
+    if r > 0
+        this.curWinStreak  += 1
+        this.curLossStreak := 0
+        if this.curWinStreak > this.maxWinStreak
+            this.maxWinStreak := this.curWinStreak
+    else
+        this.curLossStreak += 1
+        this.curWinStreak  := 0
+        if this.curLossStreak > this.maxLossStreak
+            this.maxLossStreak := this.curLossStreak
+        // circuit breaker
+        if useBreakerInput and this.curLossStreak >= breakerLossesInput
+            this.breakerUntilBar := bar_index + breakerCoolInput
+            this.curLossStreak   := 0
+    updateGridCell(cIdx, r)
+    this.signalsSinceCalib += 1
+    if useAutoCalibInput and array.size(signalRBuffer) >= calibWindowInput and this.signalsSinceCalib >= calibCooldownInput
+        int n = array.size(signalRBuffer)
+        int startIdx = n - calibWindowInput
+        float sumR = 0.0
+        for i = startIdx to n - 1
+            sumR += array.get(signalRBuffer, i)
+        float postAvgR = sumR / float(calibWindowInput)
+        if postAvgR < calibBadRInput
+            int dir = this.lastShiftDir == 0 ? 1 : (na(this.avgRAtLastShift) or postAvgR >= this.avgRAtLastShift ? this.lastShiftDir : -this.lastShiftDir)
+            this.effQ := clamp(this.effQ + dir * calibStepQInput, calibMinQInput, calibMaxQInput)
+            this.avgRAtLastShift   := postAvgR
+            this.lastShiftDir      := dir
+            this.signalsSinceCalib := 0
+        else if postAvgR > calibGoodRInput
+            this.lastShiftDir      := 0
+            this.avgRAtLastShift   := postAvgR
+            this.signalsSinceCalib := 0
+
+var LearnState learn = LearnState.new()
+
+// ============================================================================
+// BASE CALCULATIONS
+// ============================================================================
+int warmupBars = math.max(WARMUP_FLOOR, math.max(effectiveAtrLen, math.max(atrBaselineLenInput, math.max(effectiveErLen, math.max(effectiveRsiLen, math.max(rsiLookbackInput, math.max(volLenInput, math.max(pivotLenInput * 2 + 1, math.max(tqiMomLenInput, math.max(tqiStructLenInput, rangeLenInput * 2))))))))) + 10)
+bool isWarmedUp = bar_index >= warmupBars
+
+float rawAtr      = nz(ta.atr(effectiveAtrLen), 0.0)
+float atrBaseline = nz(ta.sma(rawAtr, atrBaselineLenInput), rawAtr)
+float volRatio    = safeDiv(rawAtr, atrBaseline, 1.0)
+float erValue     = calcEfficiencyRatio(sourceInput, effectiveErLen)
+float atrValue    = useEffAtrInput ? rawAtr * (0.5 + 0.5 * erValue) : rawAtr
+
+bool hasVolumeNow = not na(volume) and volume > 0
+var bool hasVolume = false
+if hasVolumeNow and not hasVolume
+    hasVolume := true
+
+float volZ = hasVolume ? calcVolumeZ(volLenInput) : 0.0
+
+// ============================================================================
+// VOLUME WEIGHTED RSI  - the ONLY RSI in this script
+// Replaces: the manual Wilder RSI block, ta.rsi(), and the separate RSI table.
+// Falls back to a plain RSI on symbols with no volume data.
+// ============================================================================
+float rsiUp   = hasVolume ? vwRma(math.max(ta.change(rsiSourceInput), 0), effectiveRsiLen)  : ta.rma(math.max(ta.change(rsiSourceInput), 0), effectiveRsiLen)
+float rsiDown = hasVolume ? vwRma(-math.min(ta.change(rsiSourceInput), 0), effectiveRsiLen) : ta.rma(-math.min(ta.change(rsiSourceInput), 0), effectiveRsiLen)
+float vwRsi   = rsiDown == 0 ? 100.0 : rsiUp == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + rsiUp / rsiDown))
+
+float vwRsiMa    = useRsiMaInput ? maSwitch(vwRsi, rsiMaLenInput, rsiMaTypeInput) : na
+float rsiLowestG = ta.lowest(vwRsi,  rsiLookbackInput)
+float rsiHighestG = ta.highest(vwRsi, rsiLookbackInput)
+bool  rsiBull    = vwRsi > 50
+bool  rsiBear    = vwRsi < 50
+
+// Consolidation strength, normalised 0..1 for gate use
+float consolRaw   = rangeScore(vwRsi, rangeLenInput)
+float consolStrength = clamp(consolRaw, 0.0, 1.0)
+bool  isConsolidating = consolStrength > gateChopMaxInput
+
+// ============================================================================
+// TREND QUALITY INDEX
+// ============================================================================
+float tqiEr  = clamp(erValue, 0.0, 1.0)
+float tqiVol = hasVolume ? mapClamp(nz(volZ, 0.0), -1.0, 2.0, 0.0, 1.0) : mapClamp(volRatio, 0.6, 1.8, 0.0, 1.0)
+
+float structHi    = ta.highest(high, tqiStructLenInput)
+float structLo    = ta.lowest(low,  tqiStructLenInput)
+float structRange = structHi - structLo
+float pricePos    = safeDiv(close - structLo, structRange, 0.5)
+float tqiStruct   = clamp(math.abs(pricePos - 0.5) * 2.0, 0.0, 1.0)
+
+float windowChange = close - close[tqiMomLenInput]
+float upMoves      = nz(math.sum(close > close[1] ? 1.0 : 0.0, tqiMomLenInput), 0.0)
+float downMoves    = nz(math.sum(close < close[1] ? 1.0 : 0.0, tqiMomLenInput), 0.0)
+float tqiMom       = windowChange > 0 ? upMoves / tqiMomLenInput : windowChange < 0 ? downMoves / tqiMomLenInput : 0.0
+
+float tqiWeightSum   = tqiWeightErInput + tqiWeightVolInput + tqiWeightStructInput + tqiWeightMomInput
+float tqiWeightDenom = tqiWeightSum > 0 ? tqiWeightSum : 1.0
+float tqiRaw = useTqiInput ? (tqiEr * tqiWeightErInput + tqiVol * tqiWeightVolInput + tqiStruct * tqiWeightStructInput + tqiMom * tqiWeightMomInput) / tqiWeightDenom : 0.5
+float tqi = clamp(tqiRaw, 0.0, 1.0)
+
+// ============================================================================
+// ADAPTIVE MULTIPLIERS
+// ============================================================================
+float legacyAdaptFactor = useAdaptiveInput ? (1.0 + adaptStrengthInput * (0.5 - erValue)) : 1.0
+
+if barstate.isfirst
+    learn.effQ := qualityStrengthInput
+if not useAutoCalibInput
+    learn.effQ := qualityStrengthInput
+float effectiveQualityStrength = learn.effQ
+
+float qualityDeviation = useTqiInput ? math.pow(1.0 - tqi, qualityCurveInput) : 0.5
+float tqiMult = 1.0 - effectiveQualityStrength + effectiveQualityStrength * (TQI_MULT_FLOOR + TQI_MULT_RANGE * qualityDeviation)
+float symMult = effectiveBaseMult * legacyAdaptFactor * tqiMult
+
+float activeMultRaw  = symMult
+float passiveMultRaw = symMult
+if useTqiInput and useAsymBandsInput
+    float asymTighten = 1.0 - asymStrengthInput * tqi * ASYM_TIGHTEN_MAX
+    float asymWiden   = 1.0 + asymStrengthInput * tqi * ASYM_WIDEN_MAX
+    activeMultRaw  := symMult * asymTighten
+    passiveMultRaw := symMult * asymWiden
+
+var float activeMultSm  = na
+var float passiveMultSm = na
+activeMultSm  := na(activeMultSm[1])  ? activeMultRaw  : (multSmoothInput ? activeMultSm[1]  * (1.0 - MULT_SMOOTH_ALPHA) + activeMultRaw  * MULT_SMOOTH_ALPHA : activeMultRaw)
+passiveMultSm := na(passiveMultSm[1]) ? passiveMultRaw : (multSmoothInput ? passiveMultSm[1] * (1.0 - MULT_SMOOTH_ALPHA) + passiveMultRaw * MULT_SMOOTH_ALPHA : passiveMultRaw)
+
+float activeMult  = activeMultSm
+float passiveMult = passiveMultSm
+
+// ============================================================================
+// ADAPTIVE SUPERTREND
+// (this is the ONE ATR trailing engine - the Chandelier Exit that duplicated
+//  it has been removed)
+// ============================================================================
+var float lowerBand = na
+var float upperBand = na
+var int   stTrend   = 1
+
+int prevTrend = na(stTrend[1]) ? 1 : stTrend[1]
+
+float lowerMult = prevTrend == 1 ? activeMult  : passiveMult
+float upperMult = prevTrend == 1 ? passiveMult : activeMult
+
+float lowerBandRaw = sourceInput - lowerMult * atrValue
+float upperBandRaw = sourceInput + upperMult * atrValue
+
+lowerBand := na(lowerBand[1]) ? lowerBandRaw : (close[1] > lowerBand[1] ? math.max(lowerBandRaw, lowerBand[1]) : lowerBandRaw)
+upperBand := na(upperBand[1]) ? upperBandRaw : (close[1] < upperBand[1] ? math.min(upperBandRaw, upperBand[1]) : upperBandRaw)
+
+bool priceFlipUp   = prevTrend == -1 and close > upperBand[1]
+bool priceFlipDown = prevTrend ==  1 and close < lowerBand[1]
+
+var int trendStartBar = 0
+int trendAge = bar_index - trendStartBar
+
+int   charFlipWindow = math.max(charFlipMinAgeInput, 3)
+float tqiWindowHigh  = ta.highest(tqi, charFlipWindow)
+
+bool charFlipCondBase = useCharFlipInput and useTqiInput and trendAge >= charFlipMinAgeInput and tqiWindowHigh > charFlipHighInput and tqi < charFlipLowInput
+bool charFlipDown = charFlipCondBase and prevTrend ==  1 and close < close[charFlipWindow]
+bool charFlipUp   = charFlipCondBase and prevTrend == -1 and close > close[charFlipWindow]
+
+bool finalFlipUp   = priceFlipUp   or charFlipUp
+bool finalFlipDown = priceFlipDown or charFlipDown
+
+stTrend := na(stTrend[1]) ? 1 : (finalFlipUp ? 1 : (finalFlipDown ? -1 : prevTrend))
+
+if stTrend != prevTrend
+    trendStartBar := bar_index
+
+float stLine = stTrend == 1 ? lowerBand : upperBand
+
+bool flipUp   = stTrend ==  1 and stTrend[1] == -1
+bool flipDown = stTrend == -1 and stTrend[1] ==  1
+
+bool charFlipFiredUp   = charFlipUp   and not priceFlipUp   and flipUp
+bool charFlipFiredDown = charFlipDown and not priceFlipDown and flipDown
+bool charFlipFired     = charFlipFiredUp or charFlipFiredDown
+
+// ============================================================================
+// EMA PULLBACK ENGINE
+// Volume confirmation now uses the SAME volume z-score as the TQI engine
+// (the separate SMA-of-volume path has been removed).
+// ============================================================================
+float emaLine = ta.ema(close, emaLengthInput)
+bool  volOK   = not hasVolume or volZ >= gateVolZMinInput
+
+bool crossLong  = ta.crossover(close, emaLine)
+bool crossShort = ta.crossunder(close, emaLine)
+
+bool pullbackLong  = low  <= emaLine and close > emaLine and close > open and volOK
+bool pullbackShort = high >= emaLine and close < emaLine and close < open and volOK
+
+bool emaLongRaw  = emaPullbackInput ? pullbackLong  : crossLong
+bool emaShortRaw = emaPullbackInput ? pullbackShort : crossShort
+
+// EMA acting as a filter rather than a trigger
+float emaSlack = emaFilterSlackInput * atrValue
+bool  emaFilterLong  = close > emaLine - emaSlack
+bool  emaFilterShort = close < emaLine + emaSlack
+
+// ============================================================================
+// SCORE BREAKDOWN
+// ============================================================================
+float pivotHigh = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+float pivotLow  = ta.pivotlow(low,   pivotLenInput, pivotLenInput)
+
+var float lastPivotHigh = na
+var float lastPivotLow  = na
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+
+calcScoreBreakdown(bool isBuy, float rsiLo, float rsiHi) =>
+    float dirMove  = isBuy ? close[3] - close : close - close[3]
+    float momScore = mapClamp(safeDiv(dirMove, atrValue, 0.0), 0.3, 2.0, 0.0, 17.0)
+    float erScore  = mapClamp(erValue, 0.15, 0.7, 0.0, 17.0)
+    float vScore   = useVolScoreInput and hasVolume ? mapClamp(volZ, 0.0, 3.0, 0.0, 17.0) : BYPASS_SCORE
+    float rsiDepth = isBuy ? math.max(0.0, rsiOSInput - rsiLo) : math.max(0.0, rsiHi - rsiOBInput)
+    float rsiScore = useRsiScoreInput ? mapClamp(rsiDepth, 0.0, 15.0, 0.0, 17.0) : BYPASS_SCORE
+    float pivDist  = isBuy and not na(lastPivotLow) ? math.abs(close - lastPivotLow) : (not isBuy and not na(lastPivotHigh) ? math.abs(lastPivotHigh - close) : 0.0)
+    float structScore = useStructureInput ? mapClampInv(safeDiv(pivDist, atrValue, 0.0), 0.0, 1.5, 16.0, 6.0) : BYPASS_SCORE
+    float breakDepth  = isBuy ? math.max(0.0, upperBand[1] - close[1]) : math.max(0.0, close[1] - lowerBand[1])
+    float breakScore  = mapClamp(safeDiv(breakDepth, atrValue, 0.0), 0.0, 1.0, 0.0, 16.0)
+    [momScore, erScore, vScore, rsiScore, structScore, breakScore]
+
+[bdMom, bdEr, bdVol, bdRsi, bdStruct, bdBreak] = calcScoreBreakdown(stTrend == 1, rsiLowestG, rsiHighestG)
+float bdTotal = bdMom + bdEr + bdVol + bdRsi + bdStruct + bdBreak
+
+// ============================================================================
+// REGIME BINS
+// ============================================================================
+int curErBin   = erBin(erValue)
+int curVolBin  = volBin(volRatio)
+int curCellIdx = cellIdx(curErBin, curVolBin)
+[curRegimeCount, curRegimeEdge] = getRegimeEdge(curCellIdx)
+
+// ============================================================================
+// RAW SIGNALS PER ENGINE
+// ============================================================================
+bool satsRawLong  = flipUp
+bool satsRawShort = flipDown
+
+bool rawLong  = switch engineModeInput
+    "SATS + EMA filter" => satsRawLong  and emaFilterLong
+    "EMA + SATS filter" => emaLongRaw   and stTrend ==  1
+    "SATS only"         => satsRawLong
+    =>                     emaLongRaw
+
+bool rawShort = switch engineModeInput
+    "SATS + EMA filter" => satsRawShort and emaFilterShort
+    "EMA + SATS filter" => emaShortRaw  and stTrend == -1
+    "SATS only"         => satsRawShort
+    =>                     emaShortRaw
+
+// ============================================================================
+// TRADE STATE DECLARATIONS
+// Declared here (ahead of the gate) because the TP Planner below reads the
+// live plan, and the gate reads the planner.
+// ============================================================================
+var int   tradeDir      = 0
+var int   tradeEntryBar = 0
+var float tradeEntry    = na
+var float tradeSl       = na
+var float tradeSlInit   = na
+var float tradeTp1      = na
+var float tradeTp2      = na
+var float tradeTp3      = na
+var float tradeTp1R     = na
+var float tradeTp2R     = na
+var float tradeTp3R     = na
+var bool  hitTp1        = false
+var bool  hitTp2        = false
+var bool  hitTp3        = false
+var int   tradeCellIdx  = -1
+
+var float lastM = na
+var float lastE = na
+var float lastV = na
+var float lastR = na
+var float lastS = na
+var float lastB = na
+var int   lastDisplaySide = 0
+var int   lastSignalBar   = 0
+
+// Proof counters: share of resolved trades that reached TP1 before the stop.
+// Sourced from real closed trades - the AGPro script ran a separate shadow
+// state machine to estimate this; that duplicate has been removed.
+var int proofTotal = 0
+var int proofWins  = 0
+
+// ============================================================================
+// DYNAMIC TP R-MULTIPLES
+// ============================================================================
+bool  useDynTp = tpModeInput == "Dynamic"
+float dynScale = useDynTp ? calcDynTpScale(tqi, volRatio, dynTpTqiWeightInput, dynTpVolWeightInput, dynTpMinScaleInput, dynTpMaxScaleInput) : 1.0
+
+float tp1Floor = math.min(dynTpFloorR1Input, dynTpCeilR3Input)
+float tp2Floor = math.min(dynTpFloorR1Input * (fixedTp2R / math.max(fixedTp1R, 0.01)), dynTpCeilR3Input)
+float tp3Floor = math.min(dynTpFloorR1Input * (fixedTp3R / math.max(fixedTp1R, 0.01)), dynTpCeilR3Input)
+float effTp1R  = useDynTp ? clamp(fixedTp1R * dynScale, tp1Floor, dynTpCeilR3Input) : fixedTp1R
+float effTp2R  = useDynTp ? clamp(fixedTp2R * dynScale, tp2Floor, dynTpCeilR3Input) : fixedTp2R
+float effTp3R  = useDynTp ? clamp(fixedTp3R * dynScale, tp3Floor, dynTpCeilR3Input) : fixedTp3R
+
+float liveTp1R = math.min(effTp1R, math.min(effTp2R, effTp3R))
+float liveTp3R = math.max(effTp1R, math.max(effTp2R, effTp3R))
+float liveTp2R = effTp1R + effTp2R + effTp3R - liveTp1R - liveTp3R
+
+// ============================================================================
+// TAKE PROFIT PLANNER
+// Decision layer only. Anchors come from the live SATS trade when one is open;
+// when flat it prices the hypothetical trade you would get by entering now, so
+// the quality score can veto a bad-looking entry BEFORE it happens.
+// ============================================================================
+float safeAtr = math.max(nz(rawAtr, ta.tr(true)), syminfo.mintick)
+
+// ---- anchor overrides ----
+var float sessionOpenPx = na
+if session.isfirstbar
+    sessionOpenPx := open
+
+int   dirOverride    = planDirInput == "Long" ? 1 : planDirInput == "Short" ? -1 : 0
+bool  manualAnchorOn = anchorSrcInput == "Manual" and manualEntryInput > 0.0
+float manualOriginPx = manualOriginInput  > 0.0 ? manualOriginInput  : na
+float manualInvalPx  = manualInvalidInput > 0.0 ? manualInvalidInput : na
+
+// ---- prospective plan (used when flat) ----
+int   prospDir = dirOverride != 0 ? dirOverride : stTrend
+float prospEntry = switch anchorSrcInput
+    "Manual"       => manualAnchorOn ? manualEntryInput : close
+    "Session Open" => nz(sessionOpenPx, close)
+    =>                close
+float prospSlBase = not na(manualOriginPx) ? manualOriginPx : (prospDir == 1 ? (not na(lastPivotLow) ? lastPivotLow : low) : (not na(lastPivotHigh) ? lastPivotHigh : high))
+
+// strategy-native invalidation (the default path - unchanged)
+float prospRawSl = prospDir == 1 ? prospSlBase - effectiveSlMult * atrValue : prospSlBase + effectiveSlMult * atrValue
+float prospMinSl = prospDir == 1 ? prospEntry - effectiveSlMult * atrValue : prospEntry + effectiveSlMult * atrValue
+float prospSlAuto = prospDir == 1 ? math.min(prospRawSl, prospMinSl) : math.max(prospRawSl, prospMinSl)
+
+// planner-native invalidation
+float invalDist  = autoInvalidModeInput == "Fixed Percent" ? prospEntry * invalidPctInput / 100.0 : invalidAtrMultInput * safeAtr
+float distStop   = prospDir == 1 ? prospEntry  - invalDist                   : prospEntry  + invalDist
+float structStop = prospDir == 1 ? prospSlBase - safeAtr * tagBufferAtrInput : prospSlBase + safeAtr * tagBufferAtrInput
+
+float prospSl0 = switch planCalcModeInput
+    "Hybrid (ATR + Structure)" => prospDir == 1 ? math.min(distStop, structStop) : math.max(distStop, structStop)
+    "ATR Only"                 => distStop
+    "Structure Only"           => structStop
+    "Manual"                   => not na(manualInvalPx) ? manualInvalPx : prospSlAuto
+    =>                            prospSlAuto
+
+bool  slIsManual = planCalcModeInput == "Manual" and not na(manualInvalPx)
+float prospCap   = math.max(slMaxDistInput, effectiveSlMult) * atrValue
+float prospSl    = slIsManual ? prospSl0 : (prospDir == 1 ? math.max(prospSl0, prospEntry - prospCap) : math.min(prospSl0, prospEntry + prospCap))
+float prospRisk  = math.abs(prospEntry - prospSl)
+float prospDirM  = prospDir == 1 ? 1.0 : -1.0
+float prospTp1   = prospEntry + prospDirM * prospRisk * liveTp1R
+float prospTp2   = prospEntry + prospDirM * prospRisk * liveTp2R
+float prospTp3   = prospEntry + prospDirM * prospRisk * liveTp3R
+
+// ---- select the active plan ----
+bool  planIsLive = tradeDir != 0 and not na(tradeEntry) and not na(tradeSlInit) and not manualAnchorOn
+int   planDir    = planIsLive ? tradeDir    : prospDir
+float planEntry  = planIsLive ? tradeEntry  : prospEntry
+float planStop   = planIsLive ? tradeSlInit : prospSl
+float planTp1    = planIsLive ? tradeTp1    : prospTp1
+float planTp2    = planIsLive ? tradeTp2    : prospTp2
+float planTp3    = planIsLive ? tradeTp3    : prospTp3
+float planRisk   = math.abs(planEntry - planStop)
+bool  planSideOK = not na(planEntry) and not na(planStop) and (planDir == 1 ? planStop < planEntry : planStop > planEntry)
+bool  planValid  = showPlannerInput and not na(planEntry) and not na(planStop) and planRisk > syminfo.mintick and not na(planTp1) and planSideOK
+
+// ---- ladder tier pricing ----
+float planDirM = planDir == 1 ? 1.0 : -1.0
+
+ladderR(int i) =>
+    switch i
+        1 => liveTp1R
+        2 => liveTp2R
+        3 => liveTp3R
+        4 => tp4RInput
+        5 => tp5RInput
+        6 => tp6RInput
+        7 => tp7RInput
+        => liveTp3R
+
+ladderPx(int i) =>
+    i == 1 ? planTp1 : i == 2 ? planTp2 : i == 3 ? planTp3 : planEntry + planDirM * planRisk * ladderR(i)
+
+ladderDone(int i, float px) =>
+    bool priceHit = planDir == 1 ? high >= px : low <= px
+    i == 1 and planIsLive ? hitTp1 : i == 2 and planIsLive ? hitTp2 : i == 3 and planIsLive ? hitTp3 : priceHit
+
+// ---- nearest unhit target across the displayed ladder ----
+int   nearestTier = 0
+float nearestTp   = na
+float nearestTpR  = na
+int   hitCount    = 0
+int   execHits    = 0
+
+for i = 1 to plannerTiersInput
+    float px = ladderPx(i)
+    bool  dn = not na(px) and ladderDone(i, px)
+    if dn
+        hitCount += 1
+        if i <= 3
+            execHits += 1
+    else if nearestTier == 0
+        nearestTier := i
+        nearestTp   := px
+        nearestTpR  := ladderR(i)
+
+if nearestTier == 0
+    nearestTier := plannerTiersInput
+    nearestTp   := ladderPx(plannerTiersInput)
+    nearestTpR  := ladderR(plannerTiersInput)
+
+// ---- confluence: round-number proximity + prior swing proximity ----
+float recentHighObstacle = ta.highest(high[1], obstructLookbackInput)
+float recentLowObstacle  = ta.lowest(low[1],   obstructLookbackInput)
+
+confluenceOf(float targetPx) =>
+    int sc = 1
+    if not na(targetPx)
+        float unit    = roundUnit(targetPx)
+        float rounded = math.round(targetPx / unit) * unit
+        if math.abs(targetPx - rounded) <= safeAtr * 0.18
+            sc += 1
+        float nearSwing = planDir == 1 ? recentHighObstacle : recentLowObstacle
+        if not na(nearSwing) and math.abs(targetPx - nearSwing) <= safeAtr * 0.35
+            sc += 1
+    math.min(sc, 3)
+
+int nearestConf = planValid ? confluenceOf(nearestTp) : 1
+
+// ---- path measurements ----
+float currentR    = planValid ? (planDir == 1 ? (close - planEntry) / planRisk : (planEntry - close) / planRisk) : na
+float distToTpAtr = planValid ? math.abs(nearestTp - close) / safeAtr : na
+float targetSpan  = planValid ? math.abs(nearestTp - close) : na
+float targetProg  = planValid ? clamp(math.abs(close - planEntry) / math.max(math.abs(nearestTp - planEntry), syminfo.mintick) * 100.0, 0.0, 160.0) : na
+
+float obstaclePx  = planValid ? (planDir == 1 ? recentHighObstacle : recentLowObstacle) : na
+float pathLow     = planValid ? math.min(close, nearestTp) : na
+float pathHigh    = planValid ? math.max(close, nearestTp) : na
+bool  obstructionInPath = planValid and not na(obstaclePx) and obstaclePx > pathLow + safeAtr * tagBufferAtrInput and obstaclePx < pathHigh - safeAtr * tagBufferAtrInput
+float obstacleShare     = obstructionInPath ? math.abs(obstaclePx - close) / math.max(targetSpan, syminfo.mintick) : 1.0
+
+// ---- component scores ----
+// trendScore reuses the SATS SuperTrend + EMA already in this script instead
+// of the two extra EMAs the original planner computed.
+float distanceScore    = planValid ? peakScore(distToTpAtr, minTargetAtrInput, idealTargetAtrInput, maxTargetAtrInput) : 0.0
+float obstructionScore = obstructionInPath ? normHighGood(obstacleShare, 0.20, 0.85) : 100.0
+float plannerTrendScore = planValid ? (planDir == 1 ? (stTrend == 1 and close >= emaLine ? 100.0 : stTrend == 1 ? 72.0 : 42.0) : (stTrend == -1 and close <= emaLine ? 100.0 : stTrend == -1 ? 72.0 : 42.0)) : 0.0
+float progressScore    = planValid ? (currentR < -0.35 ? 18.0 : currentR < 0.0 ? 44.0 : targetProg <= 92.0 ? 84.0 : 66.0) : 0.0
+float volatilityScore  = planValid ? peakScore(volRatio, 0.55, 1.10, hotVolRatioInput) : 0.0
+float confluenceScoreV = normHighGood(nearestConf, 1.0, 3.0)
+float sensOffset       = plannerSensInput == "Conservative" ? -4.0 : plannerSensInput == "Reactive" ? 4.0 : 0.0
+
+float qualityRaw  = distanceScore * 0.22 + obstructionScore * 0.24 + plannerTrendScore * 0.18 + progressScore * 0.14 + volatilityScore * 0.12 + confluenceScoreV * 0.10 + sensOffset
+int   targetQuality = planValid ? int(math.round(clamp(qualityRaw, 0.0, 100.0))) : 0
+
+int readyScore   = plannerSensInput == "Conservative" ? readyThresholdInput + 3 : plannerSensInput == "Reactive" ? readyThresholdInput - 3 : readyThresholdInput
+int monitorScore = plannerSensInput == "Conservative" ? watchThresholdInput + 3 : plannerSensInput == "Reactive" ? watchThresholdInput - 3 : watchThresholdInput
+
+// ---- proof rate from real resolved trades ----
+bool  proofReady = proofTotal >= proofMinSampleInput
+int   proofRate  = proofReady ? int(math.round(clamp(proofWins / math.max(proofTotal, 1) * 100.0, 0.0, 100.0))) : na
+string proofRead = proofReady ? str.tostring(proofRate) + "%  (" + str.tostring(proofTotal) + ")" : "Building (" + str.tostring(proofTotal) + ")"
+
+// ---- plan state + action ----
+bool targetNear   = planValid and distToTpAtr <= tagBufferAtrInput * 1.50
+bool planComplete = planValid and execHits >= 3
+bool invalidReview = planValid and planIsLive and (planDir == 1 ? low <= planStop : high >= planStop)
+
+string planState = "WAIT"
+if planValid
+    if invalidReview
+        planState := "INVALID REVIEW"
+    else if planComplete
+        planState := "PLAN COMPLETE"
+    else if targetNear
+        planState := "TARGET NEAR"
+    else if obstructionInPath and targetQuality < readyScore
+        planState := "BLOCKED"
+    else if targetQuality >= readyScore
+        planState := "TARGET READY"
+    else if targetQuality >= monitorScore
+        planState := "MONITOR"
+    else
+        planState := "LOW QUALITY"
+
+string plannerAction = switch planState
+    "TARGET READY"   => planIsLive ? "Manage Nearest TP" : "Path Is Clean"
+    "MONITOR"        => "Monitor Ladder"
+    "TARGET NEAR"    => "Review Partial State"
+    "BLOCKED"        => "Review Obstruction"
+    "PLAN COMPLETE"  => "Reset Or Archive"
+    "INVALID REVIEW" => "Review Invalidation"
+    "LOW QUALITY"    => "Wait For Cleaner Path"
+    =>                  "Waiting For Plan"
+
+// ============================================================================
+// THE ENTRY GATE
+// This is the block that was missing. Every metric below was already being
+// computed and displayed; none of it was connected to the order logic.
+// ============================================================================
+bool breakerActive = useBreakerInput and bar_index < learn.breakerUntilBar
+
+bool gTrendLong   = not gateTrendInput or stTrend ==  1
+bool gTrendShort  = not gateTrendInput or stTrend == -1
+bool gTqi         = not gateTqiInput  or tqi >= gateTqiMinInput
+bool gEr          = not gateErInput   or erValue >= gateErMinInput
+bool gChop        = not gateChopInput or not isConsolidating
+bool gRsiLong     = not gateRsiInput  or rsiBull
+bool gRsiShort    = not gateRsiInput  or rsiBear
+bool gVol         = not gateVolInput  or volOK
+bool gEdge        = not gateEdgeInput or curRegimeCount < gateEdgeMinNInput or curRegimeEdge > 0
+bool gQuality     = not gateQualityInput  or not showPlannerInput or targetQuality >= gateQualityMinInput
+bool gObstruct    = not gateObstructInput or not showPlannerInput or not obstructionInPath
+bool gProof       = not gateProofInput    or not proofReady       or proofRate >= gateProofMinInput
+bool gBreaker     = not breakerActive
+bool gWarm        = isWarmedUp
+
+bool gateCommon   = (not useGateInput) or (gTqi and gEr and gChop and gVol and gEdge and gQuality and gObstruct and gProof and gBreaker)
+bool gateLongOK   = gateCommon and ((not useGateInput) or (gTrendLong  and gRsiLong))
+bool gateShortOK  = gateCommon and ((not useGateInput) or (gTrendShort and gRsiShort))
+
+bool confirmedBuy  = rawLong  and gateLongOK  and allowLongs  and gWarm and barstate.isconfirmed
+bool confirmedSell = rawShort and gateShortOK and allowShorts and gWarm and barstate.isconfirmed
+
+bool blockedBuy  = rawLong  and allowLongs  and gWarm and barstate.isconfirmed and not gateLongOK
+bool blockedSell = rawShort and allowShorts and gWarm and barstate.isconfirmed and not gateShortOK
+
+// First failing gate, for the dashboard
+string gateReason = not useGateInput ? "gate off" : breakerActive ? "BREAKER" : not gTqi ? "TQI low" : not gEr ? "ER low" : not gChop ? "consolidating" : not gVol ? "volume low" : not gEdge ? "neg regime edge" : not gQuality ? "TP quality low" : not gObstruct ? "path obstructed" : not gProof ? "proof rate low" : "pass"
+
+// ============================================================================
+// TRADE STATE
+// ============================================================================
+bool slHitFlag    = false
+bool timeoutFlag  = false
+bool flipExitFlag = false
+
+// ---- flip exit: close an open trade when the opposite side confirms ----
+if (tradeDir == 1 and confirmedSell) or (tradeDir == -1 and confirmedBuy)
+    bool  slPierced = tradeDir == 1 ? low <= tradeSl : high >= tradeSl
+    float fRisk     = tradeDir == 1 ? tradeEntry - tradeSlInit : tradeSlInit - tradeEntry
+    float fOpenR    = slPierced ? -1.0 : (tradeDir == 1 ? safeDiv(close - tradeEntry, fRisk) : safeDiv(tradeEntry - close, fRisk))
+    float fTp1R     = nz(tradeTp1R, fixedTp1R)
+    float fTp2R     = nz(tradeTp2R, fixedTp2R)
+    float fTp3R     = nz(tradeTp3R, fixedTp3R)
+    float fTaken    = calcTimeoutR(hitTp1, hitTp2, hitTp3, fTp1R, fTp2R, fTp3R)
+    float fRem      = 1.0 - (hitTp1 ? 1.0 / 3.0 : 0.0) - (hitTp2 ? 1.0 / 3.0 : 0.0) - (hitTp3 ? 1.0 / 3.0 : 0.0)
+    float fR        = clamp(fTaken + fRem * fOpenR, -1.0, fTp3R)
+    learn.record(fR, tradeCellIdx)
+    proofTotal += 1
+    if hitTp1
+        proofWins += 1
+    flipExitFlag := true
+    tradeDir     := 0
+    tradeCellIdx := -1
+    tradeEntry   := na
+    tradeSl      := na
+    tradeSlInit  := na
+
+// ---- long entry ----
+if confirmedBuy and tradeDir == 0
+    float tEntry = close
+    float slBase = not na(lastPivotLow) ? lastPivotLow : low
+    float rawSl  = slBase - effectiveSlMult * atrValue
+    float minSl  = tEntry - effectiveSlMult * atrValue
+    float tSl    = math.min(rawSl, minSl)
+    float slCap  = math.max(slMaxDistInput, effectiveSlMult) * atrValue
+    tSl := math.max(tSl, tEntry - slCap)
+    float risk = tEntry - tSl
+    tradeDir      := 1
+    tradeEntryBar := bar_index
+    tradeEntry    := tEntry
+    tradeSl       := tSl
+    tradeSlInit   := tSl
+    tradeTp1      := tEntry + risk * liveTp1R
+    tradeTp2      := tEntry + risk * liveTp2R
+    tradeTp3      := tEntry + risk * liveTp3R
+    tradeTp1R     := liveTp1R
+    tradeTp2R     := liveTp2R
+    tradeTp3R     := liveTp3R
+    hitTp1        := false
+    hitTp2        := false
+    hitTp3        := false
+    tradeCellIdx  := curCellIdx
+    lastM := bdMom
+    lastE := bdEr
+    lastV := bdVol
+    lastR := bdRsi
+    lastS := bdStruct
+    lastB := bdBreak
+    lastDisplaySide := 1
+    lastSignalBar   := bar_index
+    strategy.entry("Long", strategy.long)
+
+// ---- short entry ----
+if confirmedSell and tradeDir == 0
+    float tEntry = close
+    float slBase = not na(lastPivotHigh) ? lastPivotHigh : high
+    float rawSl  = slBase + effectiveSlMult * atrValue
+    float minSl  = tEntry + effectiveSlMult * atrValue
+    float tSl    = math.max(rawSl, minSl)
+    float slCap  = math.max(slMaxDistInput, effectiveSlMult) * atrValue
+    tSl := math.min(tSl, tEntry + slCap)
+    float risk = tSl - tEntry
+    tradeDir      := -1
+    tradeEntryBar := bar_index
+    tradeEntry    := tEntry
+    tradeSl       := tSl
+    tradeSlInit   := tSl
+    tradeTp1      := tEntry - risk * liveTp1R
+    tradeTp2      := tEntry - risk * liveTp2R
+    tradeTp3      := tEntry - risk * liveTp3R
+    tradeTp1R     := liveTp1R
+    tradeTp2R     := liveTp2R
+    tradeTp3R     := liveTp3R
+    hitTp1        := false
+    hitTp2        := false
+    hitTp3        := false
+    tradeCellIdx  := curCellIdx
+    lastM := bdMom
+    lastE := bdEr
+    lastV := bdVol
+    lastR := bdRsi
+    lastS := bdStruct
+    lastB := bdBreak
+    lastDisplaySide := -1
+    lastSignalBar   := bar_index
+    strategy.entry("Short", strategy.short)
+
+// ---- stop management: breakeven + SuperTrend trail after TP1 ----
+if tradeDir == 1 and hitTp1 and not na(tradeEntry)
+    float beStop    = useBeInput ? tradeEntry : tradeSl
+    float trailStop = useTrailInput and stTrend == 1 ? math.max(stLine, beStop) : beStop
+    tradeSl := math.max(nz(tradeSl, trailStop), trailStop)
+
+if tradeDir == -1 and hitTp1 and not na(tradeEntry)
+    float beStop    = useBeInput ? tradeEntry : tradeSl
+    float trailStop = useTrailInput and stTrend == -1 ? math.min(stLine, beStop) : beStop
+    tradeSl := math.min(nz(tradeSl, trailStop), trailStop)
+
+// ---- 3-tier scale-out exits ----
+if tradeDir == 1
+    strategy.exit("L TP1", from_entry = "Long", qty_percent = 33,  limit = tradeTp1, stop = tradeSl)
+    strategy.exit("L TP2", from_entry = "Long", qty_percent = 50,  limit = tradeTp2, stop = tradeSl)
+    strategy.exit("L TP3", from_entry = "Long", qty_percent = 100, limit = tradeTp3, stop = tradeSl)
+
+if tradeDir == -1
+    strategy.exit("S TP1", from_entry = "Short", qty_percent = 33,  limit = tradeTp1, stop = tradeSl)
+    strategy.exit("S TP2", from_entry = "Short", qty_percent = 50,  limit = tradeTp2, stop = tradeSl)
+    strategy.exit("S TP3", from_entry = "Short", qty_percent = 100, limit = tradeTp3, stop = tradeSl)
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+int lineTransp = showTqiColorInput and useTqiInput ? clampInt(int(math.round(mapClampInv(tqi, 0.1, 0.9, 70.0, 0.0))), 0, 100) : 0
+color stLineColor = stTrend == 1 ? color.new(bullColorInput, lineTransp) : color.new(bearColorInput, lineTransp)
+
+plot(showBandsInput and isWarmedUp ? stLine : na, "SuperTrend", color = stLineColor, linewidth = 2)
+plot(showEmaInput ? emaLine : na, "EMA", color = color.new(color.orange, 30), linewidth = 1)
+
+bgcolor(showBgInput and isWarmedUp ? (stTrend == 1 ? BULL_BG : BEAR_BG) : na, title = "Trend Background")
+
+plotshape(showBlockedInput and blockedBuy  ? low  : na, title = "Blocked Long",  location = location.belowbar, style = shape.xcross, size = size.tiny, color = color.new(bullColorInput, 40))
+plotshape(showBlockedInput and blockedSell ? high : na, title = "Blocked Short", location = location.abovebar, style = shape.xcross, size = size.tiny, color = color.new(bearColorInput, 40))
+
+// ============================================================================
+// SIGNAL LABELS
+// ============================================================================
+string scoreRefStr = "/" + str.tostring(MAX_SCORE_REF)
+string tpModeTag   = useDynTp ? "Dynamic x" + str.tostring(dynScale, "#.00") : "Fixed"
+float  buyScore    = confirmedBuy  ? bdTotal : 0.0
+float  sellScore   = confirmedSell ? bdTotal : 0.0
+
+if showSignalsInput and confirmedBuy
+    label.new(bar_index, low, "BUY  " + str.tostring(buyScore, "#"), color = bullColorInput, textcolor = LABEL_TEXT, style = label.style_label_up, size = size.small, tooltip = "LONG\nScore: " + str.tostring(buyScore, "#.0") + scoreRefStr + "\nTQI: " + str.tostring(tqi, "#.00") + "\nER: " + str.tostring(erValue, "#.00") + "\nVWRSI: " + str.tostring(vwRsi, "#.0") + "\nConsol: " + str.tostring(consolStrength, "#.00") + "\nVol Z: " + str.tostring(volZ, "#.00") + "\nTP: " + tpModeTag + "\nR: " + str.tostring(liveTp1R, "#.0") + "/" + str.tostring(liveTp2R, "#.0") + "/" + str.tostring(liveTp3R, "#.0"))
+
+if showSignalsInput and confirmedSell
+    label.new(bar_index, high, "SELL  " + str.tostring(sellScore, "#"), color = bearColorInput, textcolor = LABEL_TEXT, style = label.style_label_down, size = size.small, tooltip = "SHORT\nScore: " + str.tostring(sellScore, "#.0") + scoreRefStr + "\nTQI: " + str.tostring(tqi, "#.00") + "\nER: " + str.tostring(erValue, "#.00") + "\nVWRSI: " + str.tostring(vwRsi, "#.0") + "\nConsol: " + str.tostring(consolStrength, "#.00") + "\nVol Z: " + str.tostring(volZ, "#.00") + "\nTP: " + tpModeTag + "\nR: " + str.tostring(liveTp1R, "#.0") + "/" + str.tostring(liveTp2R, "#.0") + "/" + str.tostring(liveTp3R, "#.0"))
+
+// ============================================================================
+// PROJECTED TP LADDER
+// Replaces the old entry-only risk lines. This redraws every bar on the last
+// bar so the plan is always visible - live trade when one is open, prospective
+// plan when flat. Ported from the AGPro planner's zone/rail visual.
+// ============================================================================
+var array<box>   ladderBoxes  = array.new<box>()
+var array<line>  ladderLines  = array.new<line>()
+var array<label> ladderLabels = array.new<label>()
+
+clearLadder() =>
+    while array.size(ladderBoxes) > 0
+        box.delete(array.pop(ladderBoxes))
+    while array.size(ladderLines) > 0
+        line.delete(array.pop(ladderLines))
+    while array.size(ladderLabels) > 0
+        label.delete(array.pop(ladderLabels))
+
+if barstate.islast
+    clearLadder()
+
+    if showLadderInput and planValid
+        int   xL     = bar_index
+        int   xR     = bar_index + projectionBarsInput
+        float halfW  = safeAtr * zoneWidthAtrInput
+        color entryC = color.new(#818CF8, 0)
+
+        // ---- entry reference ----
+        array.push(ladderLines, line.new(xL, planEntry, xR, planEntry, color = color.new(entryC, 20), width = 2, style = line.style_dotted))
+        if showLadderLabelsInput
+            array.push(ladderLabels, label.new(xR, planEntry, "ENTRY REF\n" + fmtPrice(planEntry), style = label.style_label_left, color = color.new(entryC, 25), textcolor = LABEL_TEXT, size = size.small))
+
+        // ---- invalidation ----
+        array.push(ladderLines, line.new(xL, planStop, xR, planStop, color = slColorInput, width = 2))
+        if showLadderLabelsInput
+            array.push(ladderLabels, label.new(xR, planStop, "INVALID\n" + fmtPrice(planStop), style = label.style_label_left, color = color.new(slColorInput, 25), textcolor = LABEL_TEXT, size = size.small))
+
+        // ---- ladder tiers ----
+        for i = 1 to plannerTiersInput
+            float px = ladderPx(i)
+            if not na(px)
+                bool   done    = ladderDone(i, px)
+                bool   isNext  = i == nearestTier
+                int    conf    = confluenceOf(px)
+                bool   isExec  = i <= 3
+                string stateTx = done ? "TAGGED" : isNext ? "NEXT" : "OPEN"
+                color  tierC   = done ? NEUTRAL_YELLOW : isNext ? entryC : tpColorInput
+
+                array.push(ladderBoxes, box.new(xL, px + halfW, xR, px - halfW,
+                     border_color = color.new(tierC, 40), border_width = 1,
+                     bgcolor = color.new(tierC, zoneTranspInput)))
+
+                if showLadderLabelsInput
+                    string allocTx = isExec ? "exec 33%" : "plan only"
+                    string txt = "TP" + str.tostring(i) + " " + stateTx + "\n" +
+                         str.tostring(conf) + "/3 Conf | " + allocTx + " | " + fmtPrice(px) + "  (" + str.tostring(ladderR(i), "#.#") + "R)"
+                    array.push(ladderLabels, label.new(xR, px, txt, style = label.style_label_left,
+                         color = color.new(tierC, 25), textcolor = LABEL_TEXT, size = size.small))
+
+        // ---- obstruction rail ----
+        if obstructionInPath and not na(obstaclePx)
+            array.push(ladderLines, line.new(xL, obstaclePx, xR, obstaclePx, color = NEUTRAL_YELLOW, width = 1, style = line.style_dashed))
+            if showLadderLabelsInput
+                array.push(ladderLabels, label.new(xR, obstaclePx, "OBSTRUCTION\n" + fmtPrice(obstaclePx), style = label.style_label_left, color = color.new(NEUTRAL_YELLOW, 25), textcolor = color.rgb(17, 24, 39), size = size.small))
+
+        // ---- live-trade current stop, when it has trailed off the initial ----
+        if planIsLive and not na(tradeSl) and math.abs(tradeSl - planStop) > syminfo.mintick
+            array.push(ladderLines, line.new(xL, tradeSl, xR, tradeSl, color = color.new(slColorInput, 35), width = 1, style = line.style_dashed))
+            if showLadderLabelsInput
+                array.push(ladderLabels, label.new(xR, tradeSl, "STOP NOW\n" + fmtPrice(tradeSl), style = label.style_label_left, color = color.new(slColorInput, 45), textcolor = LABEL_TEXT, size = size.small))
+
+// ============================================================================
+// HIT DETECTION + LEARNING FEEDBACK
+// ============================================================================
+if tradeDir != 0 and barstate.isconfirmed and not na(tradeEntry) and not na(tradeSl) and bar_index > tradeEntryBar
+    bool slHit      = tradeDir ==  1 ? low  <= tradeSl  : high >= tradeSl
+    bool tp1Reached = not slHit and (tradeDir == 1 ? high >= tradeTp1 : low <= tradeTp1)
+    bool tp2Reached = not slHit and (tradeDir == 1 ? high >= tradeTp2 : low <= tradeTp2)
+    bool tp3Reached = not slHit and (tradeDir == 1 ? high >= tradeTp3 : low <= tradeTp3)
+
+    int  tradeAge   = bar_index - tradeEntryBar
+    bool timeoutHit = tradeAge >= tradeMaxAgeInput
+
+    if tp1Reached and not hitTp1
+        hitTp1 := true
+
+    if tp2Reached and not hitTp2
+        hitTp2 := true
+
+    if tp3Reached and not hitTp3
+        hitTp3 := true
+
+    if hitTp3 or slHit or timeoutHit
+        float useTp1R = nz(tradeTp1R, fixedTp1R)
+        float useTp2R = nz(tradeTp2R, fixedTp2R)
+        float useTp3R = nz(tradeTp3R, fixedTp3R)
+        float realizedR = 0.0
+
+        if slHit
+            slHitFlag := true
+            realizedR := calcRealizedR(true, hitTp1, hitTp2, false, useTp1R, useTp2R, useTp3R)
+        else if hitTp3
+            realizedR := calcRealizedR(false, hitTp1, hitTp2, true, useTp1R, useTp2R, useTp3R)
+        else
+            timeoutFlag := true
+            float tRisk  = tradeDir == 1 ? tradeEntry - tradeSlInit : tradeSlInit - tradeEntry
+            float tOpenR = tradeDir == 1 ? safeDiv(close - tradeEntry, tRisk) : safeDiv(tradeEntry - close, tRisk)
+            float tRem   = 1.0 - (hitTp1 ? 1.0 / 3.0 : 0.0) - (hitTp2 ? 1.0 / 3.0 : 0.0)
+            realizedR := calcTimeoutR(hitTp1, hitTp2, false, useTp1R, useTp2R, useTp3R) + tRem * tOpenR
+            if timeoutHit and tradeDir == 1
+                strategy.close("Long", comment = "Timeout")
+            if timeoutHit and tradeDir == -1
+                strategy.close("Short", comment = "Timeout")
+
+        realizedR := clamp(realizedR, -1.0, useTp3R)
+        learn.record(realizedR, tradeCellIdx)
+        proofTotal += 1
+        if hitTp1
+            proofWins += 1
+
+        tradeDir     := 0
+        tradeCellIdx := -1
+        tradeEntry   := na
+        tradeSl      := na
+        tradeSlInit  := na
+
+// ============================================================================
+// DASHBOARD
+// Layout: "Side by Side" renders the signal panel and the TP Planner panel as
+// two column-pairs inside one table, so they sit next to each other on chart.
+// ============================================================================
+bool dashSideBySide = dashLayoutInput == "Side by Side"
+bool dashSeparate   = dashLayoutInput == "Separate Positions"
+
+var table dashTable    = table.new(getDashPos(dashPosStr), 4, 60, bgcolor = TABLE_BG, border_color = TABLE_BORDER, border_width = 1, frame_color = TABLE_BORDER, frame_width = 1)
+var table planTable    = table.new(getDashPos(plannerPosStr), 2, 24, bgcolor = TABLE_BG, border_color = TABLE_BORDER, border_width = 1, frame_color = TABLE_BORDER, frame_width = 1)
+
+if barstate.islast and (showDashInput or showPlannerInput)
+
+    // ---------------- shared readouts ----------------
+    [dashWinRate, dashAvgR, dashWindowDD] = calcRollingStats(calibWindowInput)
+
+    string trendStr = stTrend == 1 ? "Bullish UP" : "Bearish DOWN"
+    color  trendCol = stTrend == 1 ? bullColorInput : bearColorInput
+
+    string signalStr = confirmedBuy ? "BUY" : (confirmedSell ? "SELL" : (blockedBuy or blockedSell ? "BLOCKED" : "-"))
+    color  signalCol = confirmedBuy ? bullColorInput : (confirmedSell ? bearColorInput : (blockedBuy or blockedSell ? NEUTRAL_YELLOW : TEXT_MUTED))
+
+    string regimeStr = erValue >= ER_HIGH_THRESH ? "Trending" : (erValue >= ER_LOW_THRESH ? "Mixed" : "Choppy")
+    color  regimeCol = erValue >= ER_HIGH_THRESH ? bullColorInput : (erValue >= ER_LOW_THRESH ? NEUTRAL_YELLOW : bearColorInput)
+    string volRegStr = volRatio < VOL_LOW_THRESH ? "Low Vol" : (volRatio < VOL_HIGH_THRESH ? "Norm Vol" : "High Vol")
+
+    string tqiStr = useTqiInput ? str.tostring(tqi, "#.00") : "off"
+    color  tqiCol = useTqiInput ? (tqi > 0.6 ? bullColorInput : (tqi > 0.35 ? NEUTRAL_YELLOW : bearColorInput)) : TEXT_MUTED
+
+    string rsiStr    = str.tostring(vwRsi, "#.0")
+    color  rsiCol    = vwRsi > 50 ? bullColorInput : bearColorInput
+    string rsiMaStr  = useRsiMaInput and not na(vwRsiMa) ? str.tostring(vwRsiMa, "#.0") : "-"
+    string consolStr = str.tostring(consolStrength, "#.00")
+    color  consolCol = isConsolidating ? bearColorInput : bullColorInput
+    string volStr    = hasVolume ? str.tostring(volZ, "#.00") + "z" : "n/a"
+    string warmStr   = isWarmedUp ? "Ready" : str.tostring(warmupBars - bar_index) + " bars"
+
+    int    sigCount   = array.size(signalRBuffer)
+    string winRateStr = sigCount == 0 ? "-" : str.tostring(dashWinRate * 100, "#.0") + "%"
+    string avgRStr    = sigCount == 0 ? "-" : str.tostring(dashAvgR, "+#.00;-#.00") + "R"
+    string winDDStr   = sigCount == 0 ? "-" : str.tostring(dashWindowDD, "#.00") + "R"
+    string allDDStr   = learn.allTimeCount == 0 ? "-" : str.tostring(learn.allTimeTrough, "#.00") + "R"
+    string streakStr  = learn.allTimeCount == 0 ? "-" : "W:" + str.tostring(learn.curWinStreak) + "/" + str.tostring(learn.maxWinStreak) + " L:" + str.tostring(learn.curLossStreak) + "/" + str.tostring(learn.maxLossStreak)
+    string sampleStr  = str.tostring(sigCount) + "/" + str.tostring(MAX_HISTORY_SIGS)
+    string edgeStr    = curRegimeCount == 0 ? "-" : str.tostring(curRegimeEdge, "+#.00;-#.00") + "R (" + str.tostring(curRegimeCount) + ")"
+
+    color winRateCol = sigCount < 5 ? TEXT_MUTED : (dashWinRate >= 0.5 ? bullColorInput : bearColorInput)
+    color avgRCol    = sigCount < 5 ? TEXT_MUTED : (dashAvgR > 0 ? bullColorInput : bearColorInput)
+    color edgeCol    = curRegimeCount < 5 ? TEXT_MUTED : (curRegimeEdge > 0 ? bullColorInput : bearColorInput)
+
+    string tpModeStr = useDynTp ? "Dynamic" : "Fixed"
+    string liveRStr  = str.tostring(liveTp1R, "#.0") + " / " + str.tostring(liveTp2R, "#.0") + " / " + str.tostring(liveTp3R, "#.0")
+    string gateStr   = not useGateInput ? "OFF" : (gateReason == "pass" ? "PASS" : gateReason)
+    color  gateCol   = not useGateInput ? bearColorInput : (gateReason == "pass" ? bullColorInput : NEUTRAL_YELLOW)
+
+    // ---------------- signal panel ----------------
+    int rowA = 0
+    if showDashInput
+        dashHdr(dashTable, 0, rowA, "SATS + VWRSI", VERSION)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Engine", engineModeInput, TEXT_COLOR, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Preset", resolvedPreset, TEXT_COLOR, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Trend", trendStr, trendCol, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Signal", signalStr, signalCol, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Gate", gateStr, gateCol, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "TQI", tqiStr, tqiCol, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Regime", regimeStr + " / " + volRegStr, regimeCol, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "ER", str.tostring(erValue, "#.00"), TEXT_COLOR, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "VWRSI", rsiStr + (useRsiMaInput ? "  (MA " + rsiMaStr + ")" : ""), rsiCol, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Consolidation", consolStr, consolCol, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Vol Z", volStr, TEXT_COLOR, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "TP Mode", tpModeStr + (useDynTp ? " x" + str.tostring(dynScale, "#.00") : ""), TEXT_COLOR, false)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Live R", liveRStr, TEXT_COLOR, true)
+        rowA += 1
+        dashRow(dashTable, 0, rowA, "Status", warmStr, isWarmedUp ? bullColorInput : NEUTRAL_YELLOW, false)
+        rowA += 1
+
+        if showGateRowsInput
+            dashHdr(dashTable, 0, rowA, "Gate Checks", useGateInput ? "ON" : "OFF")
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Trend OK (L/S)", (gTrendLong ? "Y" : "N") + " / " + (gTrendShort ? "Y" : "N"), TEXT_COLOR, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "TQI / ER", (gTqi ? "Y" : "N") + " / " + (gEr ? "Y" : "N"), TEXT_COLOR, true)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Chop / Vol", (gChop ? "Y" : "N") + " / " + (gVol ? "Y" : "N"), TEXT_COLOR, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Quality / Path", (gQuality ? "Y" : "N") + " / " + (gObstruct ? "Y" : "N"), TEXT_COLOR, true)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Edge / Breaker", (gEdge ? "Y" : "N") + " / " + (gBreaker ? "Y" : "N"), breakerActive ? bearColorInput : TEXT_COLOR, false)
+            rowA += 1
+
+        if showTqiBreakdownInput and useTqiInput
+            dashHdr(dashTable, 0, rowA, "TQI Components", "0..1")
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Efficiency", str.tostring(tqiEr, "#.00"), TEXT_COLOR, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Volatility", str.tostring(tqiVol, "#.00"), TEXT_COLOR, true)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Structure", str.tostring(tqiStruct, "#.00"), TEXT_COLOR, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Mom Persist", str.tostring(tqiMom, "#.00"), TEXT_COLOR, true)
+            rowA += 1
+
+        if showPerfInput
+            dashHdr(dashTable, 0, rowA, "Performance", sampleStr)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Win Rate", winRateStr, winRateCol, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Avg R", avgRStr, avgRCol, true)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Window DD", winDDStr, sigCount < 5 ? TEXT_MUTED : bearColorInput, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "All-Time DD", allDDStr, learn.allTimeCount == 0 ? TEXT_MUTED : bearColorInput, true)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Streak W/L", streakStr, TEXT_COLOR, false)
+            rowA += 1
+            dashRow(dashTable, 0, rowA, "Regime Edge", edgeStr, edgeCol, true)
+            rowA += 1
+
+    // ---------------- TP planner panel ----------------
+    if showPlannerInput
+        color planStateCol = switch planState
+            "TARGET READY"   => planDir == 1 ? bullColorInput : bearColorInput
+            "MONITOR"        => color.new(#818CF8, 0)
+            "TARGET NEAR"    => NEUTRAL_YELLOW
+            "BLOCKED"        => NEUTRAL_YELLOW
+            "PLAN COMPLETE"  => bullColorInput
+            "INVALID REVIEW" => slColorInput
+            =>                  TEXT_MUTED
+
+        color proofCol = not proofReady ? NEUTRAL_YELLOW : proofRate >= 55 ? bullColorInput : proofRate >= 45 ? NEUTRAL_YELLOW : bearColorInput
+
+        string nearestRead = planValid ? "TP" + str.tostring(nearestTier) + " @ " + fmtPrice(nearestTp) : "Waiting"
+        string qualityRead = planValid ? str.tostring(targetQuality) + " / 100 - " + planState : "Waiting"
+        string obstructRead = planValid ? (obstructionInPath ? fmtPrice(obstaclePx) + " / " + str.tostring(obstacleShare * 100.0, "#") + "% path" : "Clean path") : "Waiting"
+        string currentRRead = planValid ? str.tostring(currentR, "#.##") + "R / TP" + str.tostring(nearestTier) + " " + str.tostring(nearestTpR, "#.##") + "R" : "Waiting"
+        string sourceRead   = planIsLive ? "Live trade" : manualAnchorOn ? "Manual anchor" : "Prospective (flat)"
+        string entryRead    = planValid ? fmtPrice(planEntry) : "Waiting"
+        string stopRead     = planValid ? fmtPrice(planStop) : "Waiting"
+
+        table tgt  = dashSeparate ? planTable : dashTable
+        int   colP = dashSideBySide ? 2 : 0
+        int   rowB = dashSideBySide or dashSeparate ? 0 : rowA
+
+        dashHdr(tgt, colP, rowB, "Take Profit Planner", planDir == 1 ? "LONG" : "SHORT")
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Plan Source", sourceRead, planIsLive ? TEXT_COLOR : TEXT_MUTED, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Entry Reference", entryRead, color.new(#818CF8, 0), false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Invalidation", stopRead, slColorInput, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Nearest TP", nearestRead, TEXT_BRIGHT, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Target Quality", qualityRead, planStateCol, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Target Proof", proofRead, proofCol, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Obstruction", obstructRead, obstructionInPath ? NEUTRAL_YELLOW : bullColorInput, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Current R", currentRRead, planValid and currentR > 0 ? bullColorInput : TEXT_COLOR, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Action", plannerAction, planStateCol, true)
+        rowB += 1
+
+        dashHdr(tgt, colP, rowB, "Quality Breakdown", "0..100")
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Distance", str.tostring(distanceScore, "#"), TEXT_COLOR, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Path Clear", str.tostring(obstructionScore, "#"), TEXT_COLOR, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Trend Support", str.tostring(plannerTrendScore, "#"), TEXT_COLOR, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Progress", str.tostring(progressScore, "#"), TEXT_COLOR, true)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Volatility Fit", str.tostring(volatilityScore, "#"), TEXT_COLOR, false)
+        rowB += 1
+        dashRow(tgt, colP, rowB, "Confluence", str.tostring(nearestConf) + " / 3", TEXT_COLOR, true)
+        rowB += 1
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+string tickerStr = syminfo.tickerid
+string tfStr     = timeframe.period
+
+if enableAlertsInput and confirmedBuy
+    string p   = str.tostring(close, format.mintick)
+    string j   = '{"action":"buy","ticker":"' + tickerStr + '","tf":"' + tfStr + '","price":' + p + ',"sl":' + str.tostring(tradeSl, format.mintick) + ',"tp1":' + str.tostring(tradeTp1, format.mintick) + ',"tp2":' + str.tostring(tradeTp2, format.mintick) + ',"tp3":' + str.tostring(tradeTp3, format.mintick) + ',"tqi":' + str.tostring(tqi, "#.00") + ',"vwrsi":' + str.tostring(vwRsi, "#.0") + '}'
+    string t   = "BUY | " + tickerStr + " | TF: " + tfStr + " | Price: " + p + " | TQI: " + str.tostring(tqi, "#.00") + " | VWRSI: " + str.tostring(vwRsi, "#.0") + " | SL: " + str.tostring(tradeSl, format.mintick) + " | TP1: " + str.tostring(tradeTp1, format.mintick) + " | TP2: " + str.tostring(tradeTp2, format.mintick) + " | TP3: " + str.tostring(tradeTp3, format.mintick)
+    alert(webhookInput ? j : t, alert.freq_once_per_bar_close)
+
+if enableAlertsInput and confirmedSell
+    string p   = str.tostring(close, format.mintick)
+    string j   = '{"action":"sell","ticker":"' + tickerStr + '","tf":"' + tfStr + '","price":' + p + ',"sl":' + str.tostring(tradeSl, format.mintick) + ',"tp1":' + str.tostring(tradeTp1, format.mintick) + ',"tp2":' + str.tostring(tradeTp2, format.mintick) + ',"tp3":' + str.tostring(tradeTp3, format.mintick) + ',"tqi":' + str.tostring(tqi, "#.00") + ',"vwrsi":' + str.tostring(vwRsi, "#.0") + '}'
+    string t   = "SELL | " + tickerStr + " | TF: " + tfStr + " | Price: " + p + " | TQI: " + str.tostring(tqi, "#.00") + " | VWRSI: " + str.tostring(vwRsi, "#.0") + " | SL: " + str.tostring(tradeSl, format.mintick) + " | TP1: " + str.tostring(tradeTp1, format.mintick) + " | TP2: " + str.tostring(tradeTp2, format.mintick) + " | TP3: " + str.tostring(tradeTp3, format.mintick)
+    alert(webhookInput ? j : t, alert.freq_once_per_bar_close)
+
+bool tp1Event = hitTp1 and not hitTp1[1]
+bool tp2Event = hitTp2 and not hitTp2[1]
+bool tp3Event = hitTp3 and not hitTp3[1]
+bool slEvent  = slHitFlag
+
+if enableAlertsInput and tp1Event
+    alert("TP1 HIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and tp2Event
+    alert("TP2 HIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and tp3Event
+    alert("TP3 HIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and slEvent
+    alert("SL HIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and timeoutFlag
+    alert("TIMEOUT EXIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and flipExitFlag
+    alert("FLIP EXIT | " + tickerStr + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if enableAlertsInput and charFlipFired and barstate.isconfirmed
+    alert("CHAR-FLIP " + (charFlipFiredUp ? "BULL" : "BEAR") + " | " + tickerStr + " | " + str.tostring(close, format.mintick) + " | TQI: " + str.tostring(tqi, "#.00"), alert.freq_once_per_bar_close)
+
+alertcondition(confirmedBuy,  title = "Buy Signal (gated)",  message = "BUY on {{ticker}} | TF: {{interval}} | Price: {{close}}")
+alertcondition(confirmedSell, title = "Sell Signal (gated)", message = "SELL on {{ticker}} | TF: {{interval}} | Price: {{close}}")
+
+bool buyScoreAPlus     = confirmedBuy  and buyScore  >= GRADE_SCORE_APLUS
+bool sellScoreAPlus    = confirmedSell and sellScore >= GRADE_SCORE_APLUS
+bool buyScoreAOrBetter = confirmedBuy  and buyScore  >= GRADE_SCORE_A
+bool sellScoreAOrBetter = confirmedSell and sellScore >= GRADE_SCORE_A
+bool buyScoreBOrBetter = confirmedBuy  and buyScore  >= GRADE_SCORE_B
+bool sellScoreBOrBetter = confirmedSell and sellScore >= GRADE_SCORE_B
+
+alertcondition(buyScoreAPlus,       title = "Buy A+ (score >=80)",  message = "BUY A+ on {{ticker}} | Price: {{close}}")
+alertcondition(sellScoreAPlus,      title = "Sell A+ (score >=80)", message = "SELL A+ on {{ticker}} | Price: {{close}}")
+alertcondition(buyScoreAOrBetter,   title = "Buy A+/A (score >=60)",  message = "BUY A+/A on {{ticker}} | Price: {{close}}")
+alertcondition(sellScoreAOrBetter,  title = "Sell A+/A (score >=60)", message = "SELL A+/A on {{ticker}} | Price: {{close}}")
+alertcondition(buyScoreBOrBetter,   title = "Buy A+/A/B (score >=40)",  message = "BUY A+/A/B on {{ticker}} | Price: {{close}}")
+alertcondition(sellScoreBOrBetter,  title = "Sell A+/A/B (score >=40)", message = "SELL A+/A/B on {{ticker}} | Price: {{close}}")
+
+bool buyTqiAPlus     = confirmedBuy  and tqi >= GRADE_TQI_APLUS
+bool sellTqiAPlus    = confirmedSell and tqi >= GRADE_TQI_APLUS
+bool buyTqiAOrBetter = confirmedBuy  and tqi >= GRADE_TQI_A
+bool sellTqiAOrBetter = confirmedSell and tqi >= GRADE_TQI_A
+
+alertcondition(buyTqiAPlus,      title = "Buy A+ (TQI >=0.70)",  message = "BUY A+ TQI on {{ticker}} | Price: {{close}}")
+alertcondition(sellTqiAPlus,     title = "Sell A+ (TQI >=0.70)", message = "SELL A+ TQI on {{ticker}} | Price: {{close}}")
+alertcondition(buyTqiAOrBetter,  title = "Buy A+/A (TQI >=0.50)",  message = "BUY A+/A TQI on {{ticker}} | Price: {{close}}")
+alertcondition(sellTqiAOrBetter, title = "Sell A+/A (TQI >=0.50)", message = "SELL A+/A TQI on {{ticker}} | Price: {{close}}")
+
+alertcondition(tp1Event,     title = "TP1 Hit",      message = "TP1 HIT on {{ticker}} | Price: {{close}}")
+alertcondition(tp2Event,     title = "TP2 Hit",      message = "TP2 HIT on {{ticker}} | Price: {{close}}")
+alertcondition(tp3Event,     title = "TP3 Hit",      message = "TP3 HIT on {{ticker}} | Price: {{close}}")
+alertcondition(slEvent,      title = "SL Hit",       message = "SL HIT on {{ticker}} | Price: {{close}}")
+alertcondition(timeoutFlag,  title = "Timeout Exit", message = "TIMEOUT EXIT on {{ticker}} | Price: {{close}}")
+alertcondition(flipExitFlag, title = "Flip Exit",    message = "FLIP EXIT on {{ticker}} | Price: {{close}}")
+alertcondition(charFlipFired, title = "Character-Flip", message = "CHAR-FLIP on {{ticker}} | Price: {{close}} (TQI collapsed)")
+
+// ---- TP Planner alerts ----
+var string previousPlanState = "WAIT"
+bool planStateShift = barstate.isconfirmed and planValid and planState != previousPlanState
+if barstate.isconfirmed
+    previousPlanState := planState
+
+bool plannerReadyEvent   = planStateShift and planState == "TARGET READY"
+bool plannerBlockedEvent = planStateShift and planState == "BLOCKED"
+bool plannerInvalidEvent = planStateShift and planState == "INVALID REVIEW"
+
+// ---- on-chart plan-state markers ----
+var array<label> planMarkers = array.new<label>()
+
+if showPlanMarkerInput and planStateShift and planState != "WAIT"
+    color markerCol = switch planState
+        "TARGET READY"   => planDir == 1 ? bullColorInput : bearColorInput
+        "MONITOR"        => color.new(#818CF8, 0)
+        "TARGET NEAR"    => NEUTRAL_YELLOW
+        "BLOCKED"        => NEUTRAL_YELLOW
+        "PLAN COMPLETE"  => bullColorInput
+        "INVALID REVIEW" => slColorInput
+        =>                  TEXT_MUTED
+    bool  darkTxt   = planState == "TARGET NEAR" or planState == "BLOCKED"
+    bool  below     = planDir == 1
+    float markerPx  = below ? low - safeAtr * 0.6 : high + safeAtr * 0.6
+
+    array.push(planMarkers, label.new(bar_index, markerPx,
+         planState + "\n" + str.tostring(targetQuality) + " / 100",
+         style     = below ? label.style_label_up : label.style_label_down,
+         color     = color.new(markerCol, 15),
+         textcolor = darkTxt ? color.rgb(17, 24, 39) : LABEL_TEXT,
+         size      = size.small))
+
+    while array.size(planMarkers) > planMarkerKeepInput
+        label.delete(array.shift(planMarkers))
+
+alertcondition(plannerReadyEvent,   title = "Planner: Target Ready",     message = "TARGET READY on {{ticker}} | Price: {{close}}")
+alertcondition(plannerBlockedEvent, title = "Planner: Path Blocked",     message = "PATH BLOCKED on {{ticker}} | Price: {{close}}")
+alertcondition(plannerInvalidEvent, title = "Planner: Invalid Review",   message = "INVALIDATION REVIEW on {{ticker}} | Price: {{close}}")
+alertcondition(planStateShift,      title = "Planner: State Shift",      message = "PLAN STATE SHIFT on {{ticker}} | Price: {{close}}")
+
+if enableAlertsInput and plannerReadyEvent
+    alert("TARGET READY | " + tickerStr + " | " + str.tostring(close, format.mintick) + " | Quality: " + str.tostring(targetQuality) + "/100 | Nearest TP" + str.tostring(nearestTier) + " @ " + fmtPrice(nearestTp), alert.freq_once_per_bar_close)
+
+if enableAlertsInput and plannerBlockedEvent
+    alert("PATH BLOCKED | " + tickerStr + " | " + str.tostring(close, format.mintick) + " | Obstruction @ " + fmtPrice(obstaclePx), alert.freq_once_per_bar_close)
