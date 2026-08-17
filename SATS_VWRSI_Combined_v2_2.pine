@@ -498,7 +498,12 @@ rangeScore(float src, int length) =>
     float f    = ta.hma(p, v) * (v + ((2.0 / 3.0) * v))
     math.max(nz(ta.hma(f, length * 2), 0.0), 0.0)
 
-calcRealizedR(bool slHit, bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2R, float tp3R) =>
+// stopR is the R-value of the stop the remainder actually exits at, measured
+// from entry against the ORIGINAL risk. It is -1.0 for an untouched initial
+// stop, ~0.0 once TP1 has moved the stop to breakeven, and positive when the
+// SuperTrend trail has dragged it into profit. Passing a flat -1.0 here (the
+// old behaviour) charged a full stop-out to trades that exited at breakeven.
+calcRealizedR(bool slHit, bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2R, float tp3R, float stopR) =>
     float realizedR = 0.0
     if tp3H
         realizedR := (tp1R + tp2R + tp3R) / 3.0
@@ -511,7 +516,7 @@ calcRealizedR(bool slHit, bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2
         if tp2H
             taken += (1.0 / 3.0) * tp2R
             remaining -= 1.0 / 3.0
-        realizedR := taken + remaining * (-1.0)
+        realizedR := taken + remaining * stopR
     realizedR
 
 calcTimeoutR(bool tp1H, bool tp2H, bool tp3H, float tp1R, float tp2R, float tp3R) =>
@@ -1069,7 +1074,7 @@ int monitorScore = plannerSensInput == "Conservative" ? watchThresholdInput + 3 
 
 // ---- proof rate from real resolved trades ----
 bool  proofReady = proofTotal >= proofMinSampleInput
-int   proofRate  = proofReady ? int(math.round(clamp(proofWins / math.max(proofTotal, 1) * 100.0, 0.0, 100.0))) : na
+int   proofRate  = proofReady ? int(math.round(clamp(float(proofWins) / float(math.max(proofTotal, 1)) * 100.0, 0.0, 100.0))) : na
 string proofRead = proofReady ? str.tostring(proofRate) + "%  (" + str.tostring(proofTotal) + ")" : "Building (" + str.tostring(proofTotal) + ")"
 
 // ---- plan state + action ----
@@ -1385,12 +1390,14 @@ if tradeDir != 0 and barstate.isconfirmed and not na(tradeEntry) and not na(trad
         float useTp2R = nz(tradeTp2R, fixedTp2R)
         float useTp3R = nz(tradeTp3R, fixedTp3R)
         float realizedR = 0.0
+        float exitRisk  = tradeDir == 1 ? tradeEntry - tradeSlInit : tradeSlInit - tradeEntry
+        float exitStopR = tradeDir == 1 ? safeDiv(tradeSl - tradeEntry, exitRisk, -1.0) : safeDiv(tradeEntry - tradeSl, exitRisk, -1.0)
 
         if slHit
             slHitFlag := true
-            realizedR := calcRealizedR(true, hitTp1, hitTp2, false, useTp1R, useTp2R, useTp3R)
+            realizedR := calcRealizedR(true, hitTp1, hitTp2, false, useTp1R, useTp2R, useTp3R, exitStopR)
         else if hitTp3
-            realizedR := calcRealizedR(false, hitTp1, hitTp2, true, useTp1R, useTp2R, useTp3R)
+            realizedR := calcRealizedR(false, hitTp1, hitTp2, true, useTp1R, useTp2R, useTp3R, exitStopR)
         else
             timeoutFlag := true
             float tRisk  = tradeDir == 1 ? tradeEntry - tradeSlInit : tradeSlInit - tradeEntry
