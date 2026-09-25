@@ -1,0 +1,204 @@
+//@version=5
+// ============================================================
+//  Golden Pocket — Session Fib v2
+//  Draws proper extending Fib lines (0, 0.70, 0.786, 1) from
+//  the session swing-low to swing-high, shades the golden
+//  pocket (0.70–0.786), marks entry when price touches it.
+//
+//  Works on stocks (RTH) and crypto/forex (24h sessions).
+//  Uses line.new() + linefill so levels extend to the right
+//  like a real TradingView Fib retracement drawing.
+// ============================================================
+indicator("Golden Pocket — Session Fib v2", overlay = true,
+     max_lines_count = 500, max_labels_count = 500,
+     max_boxes_count = 500)
+
+// ─── Inputs ────────────────────────────────────────────────
+sessRTH   = input.session("0930-1600", "Regular session (RTH)")
+tz        = input.string("America/New_York", "Session timezone")
+useRTH    = input.bool(false, "Restrict to regular trading hours only")
+gpUpper   = input.float(0.70,  "Golden pocket — upper (0.70)",  step = 0.001)
+gpLower   = input.float(0.786, "Golden pocket — lower (0.786)", step = 0.001)
+showEnds  = input.bool(true,  "Show 0 (high) / 1 (low) lines")
+alertOn   = input.bool(true,  "Alert when price enters the pocket")
+lineLen   = input.int(80,     "Line length (bars forward)", minval = 10)
+colGP     = input.color(color.teal,  "Golden pocket color")
+colBound  = input.color(color.gray,  "Boundary line color")
+entryCol  = input.color(color.lime,  "Entry signal color")
+
+// ─── Session detection ─────────────────────────────────────
+inSess  = not na(time(timeframe.period, sessRTH, tz))
+active  = useRTH ? inSess : true
+// A new session must be detected from the calendar/session itself, not from
+// `active`. With useRTH = false `active` is true on every bar, so
+// `active and not active[1]` only ever fired on the very first bar and the
+// leg anchors never reset (they drifted 10k+ bars behind -> RE10026).
+newDay  = timeframe.isintraday ? ta.change(time("D")) != 0 : true
+newSess = useRTH ? (inSess and not inSess[1]) : newDay
+
+// ─── Track the up-leg: swing low → swing high ──────────────
+var float legLow    = na
+var float legHigh   = na
+var float runLow    = na
+var int   lowBar    = na
+var int   legLowBar = na    // bar index the CURRENT legLow value was set at
+var int   highBar   = na
+var bool  fired     = false
+
+if newSess
+    legLow    := low
+    legHigh   := high
+    runLow    := low
+    lowBar    := bar_index
+    legLowBar := bar_index
+    highBar   := bar_index
+    fired     := false
+
+if active
+    // track the running low since session open
+    if na(runLow) or low < runLow
+        runLow := low
+        lowBar := bar_index
+    // every new session high re-anchors the leg
+    if na(legHigh) or high > legHigh
+        legHigh   := high
+        highBar   := bar_index
+        legLow    := runLow
+        legLowBar := lowBar
+
+// ─── Fib math ──────────────────────────────────────────────
+diff  = legHigh - legLow
+g070  = legHigh - gpUpper * diff    // 0.70 level
+g0786 = legHigh - gpLower * diff    // 0.786 level
+valid = active and diff > 0
+
+// ─── Draw extending lines + shaded zone ────────────────────
+var line  ln0    = na    // 0.0  (High)
+var line  ln1    = na    // 1.0  (Low)
+var line  lnGPu  = na    // 0.70
+var line  lnGPl  = na    // 0.786
+var line  lnDiag = na    // swing low -> swing high
+var linefill gpFill = na
+var box   gpBox  = na
+var label lbl0   = na
+var label lbl1   = na
+var label lblGPu = na
+var label lblGPl = na
+var label lblEnt = na
+
+// clean up old drawings every bar so they stay current
+line.delete(ln0)
+line.delete(ln1)
+line.delete(lnGPu)
+line.delete(lnGPl)
+line.delete(lnDiag)
+linefill.delete(gpFill)
+box.delete(gpBox)
+label.delete(lbl0)
+label.delete(lbl1)
+label.delete(lblGPu)
+label.delete(lblGPl)
+
+// Pine refuses bar-index arguments more than 10000 bars behind (and 500
+// ahead of) the current bar. Clamp every anchor so a long-running leg can
+// never blow up with RE10026.
+maxBack  = 4900
+clampBar(int b) =>
+    math.max(b, bar_index - maxBack)
+
+if valid
+    int x1 = clampBar(highBar)
+    int xL = clampBar(legLowBar)
+    int x2 = bar_index + math.min(lineLen, 400)
+
+    // 0.0 line (swing high)
+    if showEnds
+        ln0 := line.new(x1, legHigh, x2, legHigh,
+             color = colBound, width = 1, style = line.style_dashed)
+        lbl0 := label.new(x2, legHigh,
+             text = "0  (" + str.tostring(legHigh, format.mintick) + ")",
+             style = label.style_label_left, color = color.new(colBound, 100),
+             textcolor = colBound, size = size.small)
+
+    // 1.0 line (swing low)
+    if showEnds
+        ln1 := line.new(xL, legLow, x2, legLow,
+             color = colBound, width = 1, style = line.style_dashed)
+        lbl1 := label.new(x2, legLow,
+             text = "1  (" + str.tostring(legLow, format.mintick) + ")",
+             style = label.style_label_left, color = color.new(colBound, 100),
+             textcolor = colBound, size = size.small)
+
+    // 0.70 line (upper golden pocket)
+    lnGPu := line.new(x1, g070, x2, g070,
+         color = colGP, width = 2, style = line.style_solid)
+    lblGPu := label.new(x2, g070,
+         text = "0.70  (" + str.tostring(g070, format.mintick) + ")",
+         style = label.style_label_left, color = color.new(colGP, 100),
+         textcolor = colGP, size = size.small)
+
+    // 0.786 line (lower golden pocket)
+    lnGPl := line.new(x1, g0786, x2, g0786,
+         color = colGP, width = 2, style = line.style_solid)
+    lblGPl := label.new(x2, g0786,
+         text = "0.786  (" + str.tostring(g0786, format.mintick) + ")",
+         style = label.style_label_left, color = color.new(colGP, 100),
+         textcolor = colGP, size = size.small)
+
+    // Shaded golden pocket zone
+    gpBox := box.new(x1, g070, x2, g0786,
+         border_color = color.new(colGP, 60),
+         bgcolor = color.new(colGP, 82))
+
+    // Diagonal Fib line from swing low to swing high
+    lnDiag := line.new(xL, legLow, x1, legHigh,
+         color = color.new(colBound, 40), width = 1, style = line.style_dashed)
+
+// ─── Entry signal: price touches golden pocket ─────────────
+inPocket = valid and low <= g070 and high >= g0786
+enterGP  = inPocket and not inPocket[1] and not fired
+
+// Big visible entry marker
+plotshape(enterGP, title = "GP Entry", style = shape.triangleup,
+     location = location.belowbar, color = entryCol,
+     size = size.normal, text = "GP ENTRY", textcolor = entryCol)
+
+// Additional: mark bars INSIDE the pocket
+bgcolor(inPocket ? color.new(colGP, 92) : na, title = "In pocket highlight")
+
+if alertOn and enterGP
+    fired := true
+    alert("Price entered golden pocket " + str.tostring(g0786, format.mintick)
+         + " – " + str.tostring(g070, format.mintick),
+         alert.freq_once_per_bar)
+
+alertcondition(enterGP, "Golden Pocket Entry",
+     "Price entered the 0.70–0.786 golden pocket")
+
+// ─── Info table (top-right) ────────────────────────────────
+var table infoTbl = table.new(position.top_right, 2, 5,
+     bgcolor = color.new(#1a1a2e, 10),
+     border_color = color.new(colGP, 50), border_width = 1)
+
+if valid and barstate.islast
+    table.cell(infoTbl, 0, 0, "GOLDEN POCKET",
+         text_color = color.white, text_size = size.small,
+         bgcolor = color.new(colGP, 20))
+    table.cell(infoTbl, 1, 0, "",
+         bgcolor = color.new(colGP, 20))
+    table.cell(infoTbl, 0, 1, "High (0)",
+         text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTbl, 1, 1, str.tostring(legHigh, format.mintick),
+         text_color = color.white, text_size = size.tiny)
+    table.cell(infoTbl, 0, 2, "GP 0.70",
+         text_color = colGP, text_size = size.tiny)
+    table.cell(infoTbl, 1, 2, str.tostring(g070, format.mintick),
+         text_color = color.white, text_size = size.tiny)
+    table.cell(infoTbl, 0, 3, "GP 0.786",
+         text_color = colGP, text_size = size.tiny)
+    table.cell(infoTbl, 1, 3, str.tostring(g0786, format.mintick),
+         text_color = color.white, text_size = size.tiny)
+    table.cell(infoTbl, 0, 4, "Low (1)",
+         text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTbl, 1, 4, str.tostring(legLow, format.mintick),
+         text_color = color.white, text_size = size.tiny)
