@@ -1553,6 +1553,7 @@ if barstate.islast and (showDashInput or showPlannerInput)
             rowA += 1
 
     // ---------------- TP planner panel ----------------
+    int rowB = 0
     if showPlannerInput
         color planStateCol = switch planState
             "TARGET READY"   => planDir == 1 ? bullColorInput : bearColorInput
@@ -1575,7 +1576,7 @@ if barstate.islast and (showDashInput or showPlannerInput)
 
         table tgt  = dashSeparate ? planTable : dashTable
         int   colP = dashSideBySide ? 2 : 0
-        int   rowB = dashSideBySide or dashSeparate ? 0 : rowA
+        rowB := dashSideBySide or dashSeparate ? 0 : rowA
 
         dashHdr(tgt, colP, rowB, "Take Profit Planner", planDir == 1 ? "LONG" : "SHORT")
         rowB += 1
@@ -1612,6 +1613,25 @@ if barstate.islast and (showDashInput or showPlannerInput)
         rowB += 1
         dashRow(tgt, colP, rowB, "Confluence", str.tostring(nearestConf) + " / 3", TEXT_COLOR, true)
         rowB += 1
+
+    // ---------------- pad the shorter column-pair so the table has no ----------------
+    // ---------------- ragged blank space when the two panels sit side by side -------
+    if dashSideBySide and showDashInput and showPlannerInput and rowA != rowB
+        int maxRow = math.max(rowA, rowB)
+        if rowA < maxRow
+            bool fillAlt = false
+            for r = rowA to maxRow - 1
+                color bg = fillAlt ? TABLE_ROW_ALT : color.new(color.black, 100)
+                table.cell(dashTable, 0, r, "", bgcolor = bg)
+                table.cell(dashTable, 1, r, "", bgcolor = bg)
+                fillAlt := not fillAlt
+        if rowB < maxRow
+            bool fillAlt = false
+            for r = rowB to maxRow - 1
+                color bg = fillAlt ? TABLE_ROW_ALT : color.new(color.black, 100)
+                table.cell(dashTable, 2, r, "", bgcolor = bg)
+                table.cell(dashTable, 3, r, "", bgcolor = bg)
+                fillAlt := not fillAlt
 
 // ============================================================================
 // ALERTS
